@@ -349,7 +349,21 @@ app.get('/api/summary', wrap(async (req, res) => {
 }));
 
 // ---- chat (Anthropic API when key present; local `claude` CLI otherwise) ---
-const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
+// Chat client: API key, or OAuth (Max subscription) via ANTHROPIC_AUTH_TOKEN,
+// else fall back to the local `claude` CLI.
+let anthropic = null, chatMode = 'cli';
+if (process.env.ANTHROPIC_API_KEY) {
+  anthropic = new Anthropic();
+  chatMode = 'api';
+} else if (process.env.ANTHROPIC_AUTH_TOKEN) {
+  // OAuth bearer token — needs the oauth beta header; token is short-lived (~1h)
+  // and is NOT auto-refreshed here. Re-paste, or run a refresher, when it expires.
+  anthropic = new Anthropic({
+    authToken: process.env.ANTHROPIC_AUTH_TOKEN,
+    defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' },
+  });
+  chatMode = 'oauth';
+}
 const CHAT_MODEL = process.env.CHAT_MODEL || 'claude-opus-4-8';
 
 async function buildContext() {
@@ -387,8 +401,12 @@ app.post('/api/chat', wrap(async (req, res) => {
     const reply = msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
     return res.json({ reply });
   }
-  // Fallback: local claude CLI (Max subscription) — dev only.
-  const child = spawn('claude', ['-p'], { cwd: __dirname });
+  // Fallback: local `claude` CLI (subscription via OAuth, auto-refreshed by the CLI).
+  //  - CLAUDE_BIN        : absolute path to the binary if not on PATH.
+  //  - CLAUDE_CONFIG_DIR : which logged-in account/subscription to use. Point this
+  //    at a config dir you've logged into the desired account, so chat runs on that
+  //    subscription independently of any other login on the host.
+  const child = spawn(process.env.CLAUDE_BIN || 'claude', ['-p'], { cwd: __dirname, env: process.env });
   let out = '', err = '';
   child.stdout.on('data', (d) => (out += d));
   child.stderr.on('data', (d) => (err += d));
@@ -404,4 +422,4 @@ app.post('/api/chat', wrap(async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 await init();
-app.listen(PORT, () => console.log(`My Finance running → http://localhost:${PORT}  [db=${process.env.DATABASE_URL ? 'postgres' : 'sqlite'}, auth=${AUTH}, chat=${anthropic ? 'api' : 'cli'}]`));
+app.listen(PORT, () => console.log(`My Finance running → http://localhost:${PORT}  [db=${process.env.DATABASE_URL ? 'postgres' : 'sqlite'}, auth=${AUTH}, chat=${chatMode}]`));
