@@ -72,9 +72,9 @@ views.dashboard = async () => {
   app.innerHTML = `
     <h2>Dashboard</h2>
     <div class="cards">
-      <div class="card"><div class="label">Total Income</div><div class="value green">${money(s.income)}</div></div>
-      <div class="card"><div class="label">Total Expense</div><div class="value red">${money(s.expense)}</div></div>
-      <div class="card"><div class="label">Cash Balance</div><div class="value ${s.balance >= 0 ? 'green' : 'red'}">${money(s.balance)}</div></div>
+      <div class="card"><div class="label">INR on hand <span class="muted">(pays EMIs)</span></div><div class="value ${(s.balances?.INR || 0) >= 0 ? 'green' : 'red'}">${money(s.balances?.INR || 0, 'INR')}</div></div>
+      <div class="card"><div class="label">AED on hand <span class="muted">(Dubai)</span></div><div class="value ${(s.balances?.AED || 0) >= 0 ? 'green' : 'red'}">${money(s.balances?.AED || 0, 'AED')}</div></div>
+      <div class="card"><div class="label">Income / Expense (₹ equiv)</div><div class="value">${money(s.income)} <span class="muted" style="font-size:1rem;">/ ${money(s.expense)}</span></div></div>
       ${cur.map((c) => `<div class="card"><div class="label">Debt outstanding (${c})</div>
         <div class="value red">${money(s.byCurrency[c].remaining, c)}</div>
         <div class="label" style="margin-top:6px;">EMI/mo ${money(s.byCurrency[c].emi, c)}${s.byCurrency[c].interest ? ' · interest ' + money(s.byCurrency[c].interest, c) : ''}</div></div>`).join('')}
@@ -100,40 +100,91 @@ views.dashboard = async () => {
     </div>`;
 };
 
-// ---------- Ledger ----------
+// ---------- Ledger (multi-currency income/expense + AED→INR transfer) ----------
 views.ledger = async () => {
-  const entries = await api('/api/entries');
+  const [entries, s] = await Promise.all([api('/api/entries'), api('/api/summary')]);
+  const b = s.balances || { INR: 0, AED: 0 };
+
+  const kindPill = (e) => e.kind === 'transfer' ? '<span class="pill" style="background:rgba(79,156,249,.18);color:var(--accent)">transfer</span>'
+    : `<span class="pill ${e.kind}">${e.kind}</span>`;
+  const amountCell = (e) => {
+    if (e.kind === 'transfer')
+      return `<span style="color:var(--accent)">${money(e.amount, 'AED')} → ${money(e.amount * e.rate, 'INR')}</span> <span class="muted">@${e.rate}</span>`;
+    const sign = e.kind === 'income' ? '+' : '−';
+    const col = e.kind === 'income' ? 'var(--green)' : 'var(--red)';
+    const equiv = e.currency === 'AED' && e.rate ? ` <span class="muted">≈ ${money(e.amount * e.rate, 'INR')} @${e.rate}</span>` : '';
+    return `<span style="color:${col}">${sign}${money(e.amount, e.currency)}</span>${equiv}`;
+  };
+
   app.innerHTML = `
-    <h2>Income &amp; Expense</h2>
+    <h2>Earnings &amp; Expenses</h2>
+    <div class="cards">
+      <div class="card"><div class="label">INR on hand <span class="muted">(pays EMIs)</span></div><div class="value ${b.INR >= 0 ? 'green' : 'red'}">${money(b.INR, 'INR')}</div></div>
+      <div class="card"><div class="label">AED on hand <span class="muted">(Dubai)</span></div><div class="value ${b.AED >= 0 ? 'green' : 'red'}">${money(b.AED, 'AED')}</div></div>
+    </div>
+
     <div class="panel">
       <h3>Add entry</h3>
       <form class="grid" id="entry-form">
-        <label class="field">Type
-          <select name="type"><option value="income">Income</option><option value="expense">Expense</option></select></label>
-        <label class="field">Category<input name="category" placeholder="Salary, Rent, Side gig…" /></label>
-        <label class="field" style="grid-column: span 2;">Narrative<input name="narrative" placeholder="e.g. June salary + incentive" /></label>
-        <label class="field">Amount<input name="amount" type="number" step="0.01" min="0" required /></label>
+        <label class="field">Kind
+          <select name="kind" id="kind-sel">
+            <option value="income">Income</option>
+            <option value="expense">Expense</option>
+            <option value="transfer">Transfer AED → INR</option>
+          </select></label>
+        <label class="field" id="cur-field">Currency
+          <select name="currency"><option value="INR">₹ INR</option><option value="AED">AED</option></select></label>
+        <label class="field">Category<input name="category" placeholder="Salary, Incentive, Food, Rent…" /></label>
+        <label class="field" style="grid-column: span 2;">Narrative<input name="narrative" placeholder="e.g. June salary / Dubai side gig" /></label>
+        <label class="field" id="amt-field">Amount<input name="amount" type="number" step="0.0001" min="0" required /></label>
+        <label class="field" id="rate-field">Rate (₹/AED)<input name="rate" type="number" step="0.0001" min="0" placeholder="optional" /></label>
         <label class="field">Date<input name="date" type="date" value="${today()}" required /></label>
         <button class="btn" type="submit">Add</button>
       </form>
+      <p class="muted" id="entry-hint" style="margin-top:10px;font-size:.84rem;"></p>
     </div>
+
     <div class="panel">
       <h3>History</h3>
-      ${entries.length ? `<table><thead><tr><th>Date</th><th>Type</th><th>Category</th><th>Narrative</th><th class="right">Amount</th><th></th></tr></thead><tbody>
+      ${entries.length ? `<table><thead><tr><th>Date</th><th>Kind</th><th>Category</th><th>Narrative</th><th class="right">Amount</th><th></th></tr></thead><tbody>
         ${entries.map((e) => `<tr>
-          <td>${fmtDate(e.date)}</td><td><span class="pill ${e.type}">${e.type}</span></td>
+          <td>${fmtDate(e.date)}</td><td>${kindPill(e)}</td>
           <td>${esc(e.category)}</td><td class="muted">${esc(e.narrative)}</td>
-          <td class="right" style="color:${e.type === 'income' ? 'var(--green)' : 'var(--red)'}">${e.type === 'income' ? '+' : '−'}${money(e.amount)}</td>
+          <td class="right">${amountCell(e)}</td>
           <td class="right"><button class="btn danger" data-del="${e.id}">✕</button></td>
         </tr>`).join('')}
       </tbody></table>` : '<p class="empty">No entries yet.</p>'}
     </div>`;
+
+  const kindSel = $('#kind-sel');
+  const curField = $('#cur-field');
+  const rateLabel = $('#rate-field');
+  const hint = $('#entry-hint');
+  const syncForm = () => {
+    const k = kindSel.value;
+    const cur = $('select[name=currency]').value;
+    curField.style.display = k === 'transfer' ? 'none' : '';
+    rateLabel.querySelector('input').required = k === 'transfer';
+    if (k === 'transfer') {
+      rateLabel.querySelector('span, label')?.remove();
+      hint.textContent = 'Transfer: enter AED to send + the exchange rate. It subtracts AED and adds AED×rate to your INR balance.';
+    } else if (cur === 'AED') {
+      hint.textContent = 'AED income/expense. Add the receive rate to record the ₹-equivalent (AED × rate). e.g. salary 3320.75 AED @ 26.5 = ₹88,000.';
+    } else {
+      hint.textContent = 'INR income/expense credited/debited directly to your INR balance.';
+    }
+  };
+  kindSel.onchange = syncForm;
+  $('select[name=currency]').onchange = syncForm;
+  syncForm();
+
   $('#entry-form').onsubmit = async (ev) => {
     ev.preventDefault();
     const f = new FormData(ev.target);
     await api('/api/entries', { method: 'POST', body: {
-      type: f.get('type'), category: f.get('category'), narrative: f.get('narrative'),
-      amount: parseFloat(f.get('amount')), date: f.get('date') } });
+      kind: f.get('kind'), currency: f.get('currency'), category: f.get('category'),
+      narrative: f.get('narrative'), amount: parseFloat(f.get('amount')),
+      rate: parseFloat(f.get('rate')) || 0, date: f.get('date') } });
     render();
   };
   app.querySelectorAll('[data-del]').forEach((b) => b.onclick = async () => {

@@ -43,19 +43,32 @@ function debtView(debt) {
 
 // ---- entries (income / expense) -------------------------------------------
 
+// INR-equivalent of an entry (for reporting). AED amount uses its rate; INR is itself.
+function inrValue(e) {
+  if (e.kind === 'transfer') return e.amount * e.rate;       // AED -> INR received
+  return e.currency === 'AED' && e.rate ? e.amount * e.rate : (e.currency === 'INR' ? e.amount : 0);
+}
+const entryView = (e) => ({ ...e, inr_value: inrValue(e) });
+
 app.get('/api/entries', wrap((req, res) => {
-  res.json(db.prepare('SELECT * FROM entries ORDER BY date DESC, id DESC').all());
+  res.json(db.prepare('SELECT * FROM entries ORDER BY date DESC, id DESC').all().map(entryView));
 }));
 
 app.post('/api/entries', wrap((req, res) => {
-  const { type, category, narrative, amount, date } = req.body;
-  if (!['income', 'expense'].includes(type)) throw new Error('Invalid type');
+  const { kind, currency, category, narrative, amount, rate, date } = req.body;
+  if (!['income', 'expense', 'transfer'].includes(kind)) throw new Error('Invalid kind');
   if (!(amount > 0)) throw new Error('Amount must be positive');
   if (!date) throw new Error('Date required');
+  let cur = currency || 'INR';
+  let rt = Number(rate) || 0;
+  if (kind === 'transfer') {                       // AED -> INR, rate required
+    cur = 'AED';
+    if (!(rt > 0)) throw new Error('Transfer needs an exchange rate (₹/AED)');
+  }
   const info = db.prepare(
-    'INSERT INTO entries (type, category, narrative, amount, date) VALUES (?,?,?,?,?)'
-  ).run(type, category || 'General', narrative || '', amount, date);
-  res.json(db.prepare('SELECT * FROM entries WHERE id = ?').get(info.lastInsertRowid));
+    'INSERT INTO entries (kind, currency, category, narrative, amount, rate, date) VALUES (?,?,?,?,?,?,?)'
+  ).run(kind, cur, category || 'General', narrative || '', amount, rt, date);
+  res.json(entryView(db.prepare('SELECT * FROM entries WHERE id = ?').get(info.lastInsertRowid)));
 }));
 
 app.delete('/api/entries/:id', wrap((req, res) => {
@@ -215,8 +228,23 @@ app.delete('/api/payments/:id', wrap((req, res) => {
 // ---- dashboard summary -----------------------------------------------------
 
 app.get('/api/summary', wrap((req, res) => {
-  const income = db.prepare("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE type='income'").get().s;
-  const expense = db.prepare("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE type='expense'").get().s;
+  // --- two running balances: AED on hand + INR on hand ---
+  const all = db.prepare('SELECT * FROM entries').all();
+  const bal = { INR: 0, AED: 0 };
+  let incomeINR = 0, expenseINR = 0;           // INR-equivalent totals for the chart/cards
+  for (const e of all) {
+    if (e.kind === 'income') {
+      bal[e.currency] = (bal[e.currency] || 0) + e.amount;
+      incomeINR += inrValue(e);
+    } else if (e.kind === 'expense') {
+      bal[e.currency] = (bal[e.currency] || 0) - e.amount;
+      expenseINR += inrValue(e);
+    } else if (e.kind === 'transfer') {          // AED -> INR
+      bal.AED -= e.amount;
+      bal.INR += e.amount * e.rate;
+    }
+  }
+  const income = incomeINR, expense = expenseINR;
   const debts = db.prepare('SELECT * FROM debts').all().map(debtView);
   const active = debts.filter((d) => d.status !== 'closed');
 
@@ -240,13 +268,19 @@ app.get('/api/summary', wrap((req, res) => {
 
   const statusCounts = active.reduce((a, d) => { a[d.status] = (a[d.status] || 0) + 1; return a; }, {});
 
-  const monthly = db.prepare(`
-    SELECT substr(date,1,7) AS month, type, SUM(amount) AS total
-    FROM entries GROUP BY month, type ORDER BY month
-  `).all();
+  // monthly income vs expense in INR-equivalent
+  const monthMap = {};
+  for (const e of all) {
+    if (e.kind === 'transfer') continue;
+    const m = e.date.slice(0, 7);
+    monthMap[m] = monthMap[m] || { month: m, income: 0, expense: 0 };
+    monthMap[m][e.kind] += inrValue(e);
+  }
+  const monthly = Object.values(monthMap).sort((a, b) => a.month.localeCompare(b.month))
+    .flatMap((r) => [{ month: r.month, type: 'income', total: r.income }, { month: r.month, type: 'expense', total: r.expense }]);
 
   res.json({
-    income, expense, balance: income - expense,
+    income, expense, balance: income - expense, balances: bal,
     byCurrency, schedule: sched, statusCounts,
     debtCount: active.length, monthly,
   });
@@ -255,11 +289,18 @@ app.get('/api/summary', wrap((req, res) => {
 // ---- chat (uses the local `claude` CLI = your Max subscription) ------------
 
 function buildContext() {
-  const entries = db.prepare('SELECT * FROM entries ORDER BY date DESC LIMIT 50').all();
-  const debts = db.prepare('SELECT * FROM debts').all();
-  const income = db.prepare("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE type='income'").get().s;
-  const expense = db.prepare("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE type='expense'").get().s;
-  return JSON.stringify({ totals: { income, expense, balance: income - expense }, debts, recentEntries: entries }, null, 0);
+  const entries = db.prepare('SELECT * FROM entries ORDER BY date DESC LIMIT 60').all().map(entryView);
+  const debts = db.prepare('SELECT * FROM debts').all().map(debtView);
+  const bal = { INR: 0, AED: 0 };
+  for (const e of db.prepare('SELECT * FROM entries').all()) {
+    if (e.kind === 'income') bal[e.currency] += e.amount;
+    else if (e.kind === 'expense') bal[e.currency] -= e.amount;
+    else if (e.kind === 'transfer') { bal.AED -= e.amount; bal.INR += e.amount * e.rate; }
+  }
+  return JSON.stringify({
+    note: 'Salary/incentive are decided in INR but paid in AED at a receive rate, then transferred AED->INR at a different rate. Balances below are live: INR pays the EMIs.',
+    balances: bal, debts, recentEntries: entries,
+  }, null, 0);
 }
 
 app.post('/api/chat', wrap((req, res) => {

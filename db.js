@@ -8,14 +8,20 @@ db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
 db.exec(`
-  -- Income & expense ledger entries
+  -- Multi-currency ledger: income, expense, and AED->INR transfers.
+  --   kind     : income | expense | transfer
+  --   currency : currency of amount (income/expense). For a transfer it is the
+  --              SOURCE currency (AED) and INR received = amount * rate.
+  --   rate     : INR per 1 AED (optional for income/expense, applied for transfer)
   CREATE TABLE IF NOT EXISTS entries (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    type        TEXT NOT NULL CHECK (type IN ('income','expense')),
+    kind        TEXT NOT NULL DEFAULT 'income' CHECK (kind IN ('income','expense','transfer')),
+    currency    TEXT NOT NULL DEFAULT 'INR',
     category    TEXT NOT NULL DEFAULT 'General',
     narrative   TEXT NOT NULL DEFAULT '',
     amount      REAL NOT NULL,
-    date        TEXT NOT NULL,           -- YYYY-MM-DD
+    rate        REAL NOT NULL DEFAULT 0,  -- INR per AED
+    date        TEXT NOT NULL,            -- YYYY-MM-DD
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -45,5 +51,27 @@ db.exec(`
     note      TEXT NOT NULL DEFAULT ''
   );
 `);
+
+// --- migrate an older entries table (type/no currency) to the new schema ---
+const cols = db.prepare("PRAGMA table_info(entries)").all().map((c) => c.name);
+if (cols.includes('type') && !cols.includes('kind')) {
+  db.exec(`
+    ALTER TABLE entries RENAME TO entries_old;
+    CREATE TABLE entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind TEXT NOT NULL DEFAULT 'income' CHECK (kind IN ('income','expense','transfer')),
+      currency TEXT NOT NULL DEFAULT 'INR',
+      category TEXT NOT NULL DEFAULT 'General',
+      narrative TEXT NOT NULL DEFAULT '',
+      amount REAL NOT NULL,
+      rate REAL NOT NULL DEFAULT 0,
+      date TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO entries (id, kind, currency, category, narrative, amount, rate, date, created_at)
+      SELECT id, type, 'INR', category, narrative, amount, 0, date, created_at FROM entries_old;
+    DROP TABLE entries_old;
+  `);
+}
 
 export default db;
