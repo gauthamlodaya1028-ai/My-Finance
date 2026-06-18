@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>My Finance</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">💰 My Finance</div>
+    <nav class="tabs">
+      <button class="tab active" data-view="dashboard">Dashboard</button>
+      <button class="tab" data-view="ledger">Income / Expense</button>
+      <button class="tab" data-view="debts">Debts &amp; Receivables</button>
+      <button class="tab" data-view="calendar">Calendar</button>
+    </nav>
+  </header>
+
+  <main id="app"></main>
+
+  <!-- Modal host -->
+  <div id="modal-host"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

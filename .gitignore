@@ -1,0 +1,5 @@
+node_modules/
+finance.db
+finance.db-shm
+finance.db-wal
+.DS_Store
