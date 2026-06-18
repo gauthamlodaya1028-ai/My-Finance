@@ -217,6 +217,7 @@ views.debts = async () => {
     <td>${d.monthly_interest ? `<span style="color:var(--red)">${money(d.monthly_interest, d.currency)}/mo</span>` : '—'}</td>
     <td class="right">
       ${d.status === 'paying' ? `<button class="btn small" data-pay="${d.id}">Pay</button>` : ''}
+      ${d.monthly_interest > 0 ? `<button class="btn ghost small" data-int="${d.id}">Interest</button>` : ''}
       <button class="btn ghost small" data-edit="${d.id}">Edit</button>
       <button class="btn danger" data-del-d="${d.id}">✕</button>
     </td></tr>`;
@@ -266,6 +267,7 @@ views.debts = async () => {
     if (confirm('Delete this recurring expense?')) { await api('/api/recurring/' + b.dataset.delR, { method: 'DELETE' }); render(); }
   });
   app.querySelectorAll('[data-pay]').forEach((b) => b.onclick = () => payModal(debts.find((d) => d.id == b.dataset.pay)));
+  app.querySelectorAll('[data-int]').forEach((b) => b.onclick = () => interestModal(debts.find((d) => d.id == b.dataset.int)));
   app.querySelectorAll('[data-edit]').forEach((b) => b.onclick = () => debtModal(debts.find((d) => d.id == b.dataset.edit)));
   app.querySelectorAll('[data-del-d]').forEach((b) => b.onclick = async () => {
     if (confirm('Delete this debt?')) { await api('/api/debts/' + b.dataset.delD, { method: 'DELETE' }); render(); }
@@ -285,7 +287,8 @@ function debtModal(d) {
       <label class="field">EMI / month<input name="emi" type="number" step="0.01" value="${v.emi}" /></label>
       <label class="field">Remaining months<input name="remaining_months" type="number" value="${v.remaining_months}" /></label>
       <label class="field">Start month<input name="start_month" type="month" value="${v.start_month || thisMonth()}" /></label>
-      <label class="field">Interest /mo (optional)<input name="monthly_interest" type="number" step="0.01" value="${v.monthly_interest}" /></label>
+      <label class="field">Interest /mo estimate<input name="monthly_interest" type="number" step="0.01" value="${v.monthly_interest}" /></label>
+      <label class="field">Interest due days<input name="interest_days" value="${esc(v.interest_days || '')}" placeholder="e.g. 20,30" /></label>
       <label class="field" style="grid-column: span 2;">Notes<input name="notes" value="${esc(v.notes)}" /></label>
       <button class="btn" type="submit">${d ? 'Save' : 'Add'}</button>
     </form>`, (close) => {
@@ -297,7 +300,7 @@ function debtModal(d) {
         remaining: parseFloat(f.get('remaining')) || 0, emi: parseFloat(f.get('emi')) || 0,
         remaining_months: parseInt(f.get('remaining_months')) || 0,
         start_month: f.get('start_month'), monthly_interest: parseFloat(f.get('monthly_interest')) || 0,
-        notes: f.get('notes'),
+        interest_days: f.get('interest_days') || '', notes: f.get('notes'),
       };
       if (d) await api('/api/debts/' + d.id, { method: 'PATCH', body });
       else await api('/api/debts', { method: 'POST', body });
@@ -322,6 +325,42 @@ function payModal(d) {
         amount: parseFloat(f.get('amount')), date: f.get('date'), note: f.get('note') } });
       close(); render();
     };
+  });
+}
+
+async function interestModal(d) {
+  const pays = await api(`/api/debts/${d.id}/interest`);
+  const month = thisMonth();
+  const thisMonthTotal = pays.filter((p) => p.date.slice(0, 7) === month).reduce((a, p) => a + p.amount, 0);
+  const total = pays.reduce((a, p) => a + p.amount, 0);
+  openModal(`Interest — ${d.source}`, `
+    <p class="muted" style="margin-bottom:6px;">Principal stays at <b>${money(d.remaining, d.currency)}</b> — interest does not reduce it.</p>
+    <div class="cards" style="grid-template-columns:repeat(2,1fr);">
+      <div class="card"><div class="label">Paid this month</div><div class="value amber">${money(thisMonthTotal, d.currency)}</div></div>
+      <div class="card"><div class="label">Paid all-time</div><div class="value red">${money(total, d.currency)}</div></div>
+    </div>
+    <h3 style="margin:14px 0 8px;">Log an interest payment</h3>
+    <form class="grid" id="int-form">
+      <label class="field">Amount<input name="amount" type="number" step="0.01" min="0" required placeholder="actual amount" /></label>
+      <label class="field">Date<input name="date" type="date" value="${today()}" required /></label>
+      <label class="field" style="grid-column: span 2;">Note<input name="note" placeholder="e.g. 20th cycle" /></label>
+      <button class="btn" type="submit">Log payment</button>
+    </form>
+    <h3 style="margin:16px 0 8px;">History</h3>
+    ${pays.length ? `<table><thead><tr><th>Date</th><th>Note</th><th class="right">Amount</th><th></th></tr></thead><tbody>
+      ${pays.map((p) => `<tr><td>${fmtDate(p.date)}</td><td class="muted">${esc(p.note)}</td><td class="right">${money(p.amount, d.currency)}</td>
+      <td class="right"><button class="btn danger" data-deli="${p.id}">✕</button></td></tr>`).join('')}
+    </tbody></table>` : '<p class="empty">No interest logged yet.</p>'}`, (close) => {
+    $('#int-form').onsubmit = async (ev) => {
+      ev.preventDefault();
+      const f = new FormData(ev.target);
+      await api(`/api/debts/${d.id}/interest`, { method: 'POST', body: {
+        amount: parseFloat(f.get('amount')), date: f.get('date'), note: f.get('note') } });
+      close(); render();
+    };
+    modalHost.querySelectorAll('[data-deli]').forEach((b) => b.onclick = async () => {
+      await api('/api/interest/' + b.dataset.deli, { method: 'DELETE' }); close(); render();
+    });
   });
 }
 

@@ -35,12 +35,22 @@ db.exec(`
     emi              REAL DEFAULT 0,                -- equated monthly installment
     remaining_months INTEGER DEFAULT 0,            -- months left in the plan
     currency         TEXT NOT NULL DEFAULT 'INR',   -- INR | AED
-    monthly_interest REAL NOT NULL DEFAULT 0,       -- interest bleeding per month (e.g. Nizam)
+    monthly_interest REAL NOT NULL DEFAULT 0,       -- estimated interest per month (e.g. Nizam)
+    interest_days    TEXT NOT NULL DEFAULT '',       -- due days each month, e.g. "20,30"
     status           TEXT NOT NULL DEFAULT 'paying'
                      CHECK (status IN ('paying','not_decided','not_possible','closed')),
     start_month      TEXT,                          -- YYYY-MM the schedule starts
     notes            TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- Logged interest payments (variable amount), e.g. Nizam's card twice a month.
+  CREATE TABLE IF NOT EXISTS interest_payments (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    debt_id   INTEGER NOT NULL REFERENCES debts(id) ON DELETE CASCADE,
+    amount    REAL NOT NULL,
+    date      TEXT NOT NULL,
+    note      TEXT NOT NULL DEFAULT ''
   );
 
   -- Recurring monthly outflows that are NOT amortizing EMIs (rent, subscriptions…)
@@ -67,6 +77,10 @@ db.exec(`
 
 // --- migrate an older entries table (type/no currency) to the new schema ---
 const cols = db.prepare("PRAGMA table_info(entries)").all().map((c) => c.name);
+const dcols = db.prepare("PRAGMA table_info(debts)").all().map((c) => c.name);
+if (dcols.length && !dcols.includes('interest_days')) {
+  db.exec("ALTER TABLE debts ADD COLUMN interest_days TEXT NOT NULL DEFAULT ''");
+}
 if (cols.length && !cols.includes('recv_currency')) {
   db.exec("ALTER TABLE entries ADD COLUMN recv_currency TEXT NOT NULL DEFAULT 'INR'");
   db.exec("UPDATE entries SET recv_currency = currency");

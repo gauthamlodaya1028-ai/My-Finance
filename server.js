@@ -45,12 +45,21 @@ function debtView(debt) {
 function commitmentsForMonth(ym, debts, recurrings) {
   const items = [];
   const now = thisMonth();
+  const ord = (n) => n + (['th','st','nd','rd'][(n % 100 - 20) % 10] || ['th','st','nd','rd'][n] || 'th');
   for (const d of debts) {
     if (d.status === 'closed') continue;
     const se = (d.schedule || scheduleFor(d)).find((s) => s.month === ym);
     if (se) items.push({ label: d.source, amount: se.amount, currency: d.currency, type: 'emi' });
-    if (d.monthly_interest > 0 && ym >= now)
-      items.push({ label: d.source + ' (interest)', amount: d.monthly_interest, currency: d.currency, type: 'interest' });
+    if (d.monthly_interest > 0 && ym >= now) {
+      const days = (d.interest_days || '').split(',').map((x) => parseInt(x.trim())).filter((x) => x >= 1 && x <= 31);
+      if (days.length > 1) {
+        const per = d.monthly_interest / days.length;
+        for (const dy of days)
+          items.push({ label: `${d.source} (interest ${ord(dy)})`, amount: per, currency: d.currency, type: 'interest', estimate: true });
+      } else {
+        items.push({ label: d.source + ' (interest est.)', amount: d.monthly_interest, currency: d.currency, type: 'interest', estimate: true });
+      }
+    }
   }
   for (const r of recurrings) {
     if (r.start_month <= ym && (!r.end_month || ym <= r.end_month))
@@ -118,7 +127,7 @@ app.get('/api/debts', wrap((req, res) => {
 }));
 
 const DEBT_FIELDS = ['source', 'direction', 'remaining', 'emi', 'remaining_months',
-  'currency', 'monthly_interest', 'status', 'start_month', 'notes'];
+  'currency', 'monthly_interest', 'interest_days', 'status', 'start_month', 'notes'];
 
 function insertDebt(b) {
   if (!b.source) throw new Error('Source required');
@@ -131,13 +140,14 @@ function insertDebt(b) {
     remaining_months: Number(b.remaining_months) || 0,
     currency: b.currency || 'INR',
     monthly_interest: Number(b.monthly_interest) || 0,
+    interest_days: b.interest_days || '',
     status: b.status || 'paying',
     start_month: b.start_month || thisMonth(),
     notes: b.notes || '',
   };
   const info = db.prepare(`INSERT INTO debts
-    (source,direction,remaining,emi,remaining_months,currency,monthly_interest,status,start_month,notes)
-    VALUES (@source,@direction,@remaining,@emi,@remaining_months,@currency,@monthly_interest,@status,@start_month,@notes)`)
+    (source,direction,remaining,emi,remaining_months,currency,monthly_interest,interest_days,status,start_month,notes)
+    VALUES (@source,@direction,@remaining,@emi,@remaining_months,@currency,@monthly_interest,@interest_days,@status,@start_month,@notes)`)
     .run(row);
   return info.lastInsertRowid;
 }
@@ -289,6 +299,28 @@ app.delete('/api/payments/:id', wrap((req, res) => {
   res.json({ ok: true });
 }));
 
+// ---- interest payments (variable; do NOT reduce principal) ------------------
+
+app.get('/api/debts/:id/interest', wrap((req, res) => {
+  res.json(db.prepare('SELECT * FROM interest_payments WHERE debt_id = ? ORDER BY date DESC, id DESC').all(req.params.id));
+}));
+
+app.post('/api/debts/:id/interest', wrap((req, res) => {
+  const debt = db.prepare('SELECT * FROM debts WHERE id = ?').get(req.params.id);
+  if (!debt) throw new Error('Debt not found');
+  const { amount, date, note } = req.body;
+  if (!(amount > 0)) throw new Error('Amount must be positive');
+  if (!date) throw new Error('Date required');
+  db.prepare('INSERT INTO interest_payments (debt_id, amount, date, note) VALUES (?,?,?,?)')
+    .run(debt.id, amount, date, note || '');
+  res.json({ ok: true });
+}));
+
+app.delete('/api/interest/:id', wrap((req, res) => {
+  db.prepare('DELETE FROM interest_payments WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+}));
+
 // ---- dashboard summary -----------------------------------------------------
 
 app.get('/api/summary', wrap((req, res) => {
@@ -309,8 +341,16 @@ app.get('/api/summary', wrap((req, res) => {
       bal.INR += e.amount * e.rate;
     }
   }
-  const income = incomeINR, expense = expenseINR;
   const debts = db.prepare('SELECT * FROM debts').all().map(debtView);
+  // logged interest payments are real cash out, in the debt's currency
+  const curById = Object.fromEntries(debts.map((d) => [d.id, d.currency]));
+  let interestPaidTotal = 0;
+  for (const ip of db.prepare('SELECT * FROM interest_payments').all()) {
+    const c = curById[ip.debt_id] || 'INR';
+    bal[c] = (bal[c] || 0) - ip.amount;
+    if (c === 'INR') interestPaidTotal += ip.amount;
+  }
+  const income = incomeINR, expense = expenseINR;
   const active = debts.filter((d) => d.status !== 'closed');
 
   // outstanding & monthly interest grouped by currency
@@ -351,6 +391,7 @@ app.get('/api/summary', wrap((req, res) => {
 
   res.json({
     income, expense, balance: income - expense, balances: bal,
+    interestPaidTotal,
     byCurrency, schedule: sched, statusCounts,
     debtCount: active.length, monthly,
   });
