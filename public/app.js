@@ -290,6 +290,8 @@ function importModal() {
   openModal('Import debts from CSV', `
     <p class="muted" style="margin-bottom:12px;">Paste your "Budgeting - Debt" CSV (with Source, Remaining, EMI, Remaining Month columns). AED detected from the source name; "Not paid/decided/asking" and "Not possible" become statuses automatically.</p>
     <textarea id="csv-text" rows="8" style="width:100%;" placeholder="Source,Remaining,Equated Monthly Installment,Remaining Month,..."></textarea>
+    <label class="field" style="margin:12px 0;max-width:200px;">Schedule starts
+      <input type="month" id="csv-start" value="${thisMonth()}" /></label>
     <label style="display:flex;gap:8px;align-items:center;margin:12px 0;font-size:.88rem;">
       <input type="checkbox" id="csv-replace" /> Replace all existing debts</label>
     <button class="btn" id="csv-go">Import</button>
@@ -298,7 +300,7 @@ function importModal() {
       const csv = $('#csv-text').value.trim();
       if (!csv) { $('#csv-msg').textContent = 'Paste CSV first.'; return; }
       try {
-        const r = await api('/api/debts/import', { method: 'POST', body: { csv, replace: $('#csv-replace').checked } });
+        const r = await api('/api/debts/import', { method: 'POST', body: { csv, replace: $('#csv-replace').checked, start_month: $('#csv-start').value } });
         $('#csv-msg').textContent = `Imported ${r.imported} rows.`;
         setTimeout(() => { close(); render(); }, 700);
       } catch (e) { $('#csv-msg').textContent = 'Error: ' + e.message; }

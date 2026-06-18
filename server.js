@@ -160,6 +160,7 @@ app.post('/api/debts/import', wrap((req, res) => {
   const rows = parseCsv(text);
   if (rows.length < 2) throw new Error('CSV has no data rows');
   const replace = !!req.body.replace;
+  const startMonth = req.body.start_month || thisMonth();   // schedule starts here
   if (replace) db.prepare('DELETE FROM debts').run();
 
   let imported = 0;
@@ -189,6 +190,7 @@ app.post('/api/debts/import', wrap((req, res) => {
       insertDebt({
         source: source.trim(), remaining: num(remaining), emi,
         remaining_months: months, currency, monthly_interest, status, notes,
+        start_month: startMonth,
       });
       imported++;
     }
