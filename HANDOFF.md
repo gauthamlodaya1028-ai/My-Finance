@@ -23,22 +23,25 @@ He is planning to relocate to India (~Nov 2026). The app's currency model exists
 
 ---
 
-## 2. Current tech stack (local / pre-hosting)
+## 2. Current tech stack (dual-mode: local + production)
 
 | Layer    | Choice |
 |----------|--------|
 | Runtime  | Node.js (ESM, `"type":"module"`) |
-| Server   | Express ([server.js](server.js)) |
-| Database | **SQLite** via `better-sqlite3`, file `finance.db` ([db.js](db.js)) |
-| Frontend | Plain HTML/CSS/JS, no build step ([public/](public/)) |
-| Chat     | Spawns the local **`claude` CLI** in print mode (uses the user's Claude Max plan) |
+| Server   | Express ([server.js](server.js)), fully async |
+| Database | **SQLite** (`better-sqlite3`) locally; **Supabase Postgres** (`pg`) when `DATABASE_URL` is set. One async query layer in [db.js](db.js) (`q`/`one`, `$N` placeholders). |
+| Auth     | **Supabase Auth** (magic link) when `SUPABASE_URL` is set; **off** locally. Backend verifies JWT per request; frontend gate in [public/app.js](public/app.js). |
+| Frontend | Plain HTML/CSS/JS, no build step ([public/](public/)); Supabase JS from CDN |
+| Chat     | **Anthropic API** (`@anthropic-ai/sdk`, `CHAT_MODEL`, default `claude-opus-4-8`) when `ANTHROPIC_API_KEY` is set; falls back to the local **`claude` CLI** otherwise |
 
-Run locally:
+Run locally (zero config → SQLite, no auth, chat via CLI):
 ```bash
 npm install
 npm start          # http://localhost:3000
 ```
-`finance.db` is **gitignored** — data is local only. Back it up by copying that file.
+Production is all env-driven — see [.env.example](.env.example) and **[DEPLOY.md](DEPLOY.md)**.
+`finance.db` and `.env` are **gitignored**. Move local data to Postgres with
+`node migrate-to-postgres.js` (needs `DATABASE_URL`).
 
 ---
 

@@ -1,4 +1,5 @@
 node_modules/
+.env
 finance.db
 finance.db-shm
 finance.db-wal

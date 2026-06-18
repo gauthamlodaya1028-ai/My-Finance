@@ -4,8 +4,13 @@ const app = $('#app');
 const modalHost = $('#modal-host');
 
 const api = async (url, opts) => {
+  const headers = { 'Content-Type': 'application/json' };
+  if (window._sb) {
+    const { data: { session } } = await window._sb.auth.getSession();
+    if (session) headers.Authorization = 'Bearer ' + session.access_token;
+  }
   const r = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     ...opts,
     body: opts?.body ? JSON.stringify(opts.body) : undefined,
   });
@@ -463,5 +468,40 @@ function mountChat() {
   });
 }
 
-mountChat();
-render();
+// ---------- auth bootstrap ----------
+function showLogin(sb, msg) {
+  document.querySelector('.tabs').style.display = 'none';
+  app.innerHTML = `
+    <div class="panel" style="max-width:420px;margin:60px auto;">
+      <h2 style="margin-bottom:8px;">Sign in</h2>
+      <p class="muted" style="margin-bottom:16px;">Enter your email — we'll send a magic sign-in link.</p>
+      <form id="login-form" class="grid" style="grid-template-columns:1fr;">
+        <label class="field">Email<input name="email" type="email" required placeholder="you@example.com" /></label>
+        <button class="btn" type="submit">Send magic link</button>
+      </form>
+      <p class="muted" id="login-msg" style="margin-top:12px;">${msg || ''}</p>
+    </div>`;
+  $('#login-form').onsubmit = async (ev) => {
+    ev.preventDefault();
+    const email = new FormData(ev.target).get('email');
+    $('#login-msg').textContent = 'Sending…';
+    const { error } = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.origin } });
+    $('#login-msg').textContent = error ? 'Error: ' + error.message : 'Check your email for the sign-in link.';
+  };
+}
+
+async function boot() {
+  let cfg;
+  try { cfg = await fetch('/api/config').then((r) => r.json()); }
+  catch { cfg = { authEnabled: false }; }
+  if (cfg.authEnabled) {
+    const sb = window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseAnonKey);
+    window._sb = sb;
+    sb.auth.onAuthStateChange(() => {}); // keep session fresh
+    const { data: { session } } = await sb.auth.getSession();
+    if (!session) { showLogin(sb); return; }
+  }
+  mountChat();
+  render();
+}
+boot();

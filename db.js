@@ -1,108 +1,109 @@
+// Dual-mode data layer:
+//   • Local dev  → SQLite (finance.db), no DATABASE_URL needed.
+//   • Production → Supabase Postgres when DATABASE_URL is set.
+// One async query surface (q / one) using $1,$2 placeholders for both drivers.
 import Database from 'better-sqlite3';
+import pg from 'pg';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const db = new Database(join(__dirname, 'finance.db'));
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+export const PG = !!process.env.DATABASE_URL;
+let pool, sdb;
 
-db.exec(`
-  -- Multi-currency ledger: income, expense, and AED->INR transfers.
-  --   kind     : income | expense | transfer
-  --   currency : currency of amount (income/expense). For a transfer it is the
-  --              SOURCE currency (AED) and INR received = amount * rate.
-  --   rate     : INR per 1 AED (optional for income/expense, applied for transfer)
-  CREATE TABLE IF NOT EXISTS entries (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        TEXT NOT NULL DEFAULT 'income' CHECK (kind IN ('income','expense','transfer')),
-    currency    TEXT NOT NULL DEFAULT 'INR',  -- currency the amount is entered in
-    recv_currency TEXT NOT NULL DEFAULT 'INR', -- currency it lands in (balance credited)
-    category    TEXT NOT NULL DEFAULT 'General',
-    narrative   TEXT NOT NULL DEFAULT '',
-    amount      REAL NOT NULL,
-    rate        REAL NOT NULL DEFAULT 0,  -- INR per AED
-    date        TEXT NOT NULL,            -- YYYY-MM-DD
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-
-  -- Debts: EMI-based and informal. 'remaining' is the live outstanding balance.
-  CREATE TABLE IF NOT EXISTS debts (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    source           TEXT NOT NULL,                 -- lender / counterparty
-    direction        TEXT NOT NULL DEFAULT 'payable' CHECK (direction IN ('payable','receivable')),
-    remaining        REAL NOT NULL,                 -- current outstanding
-    emi              REAL DEFAULT 0,                -- equated monthly installment
-    remaining_months INTEGER DEFAULT 0,            -- months left in the plan
-    currency         TEXT NOT NULL DEFAULT 'INR',   -- INR | AED
-    monthly_interest REAL NOT NULL DEFAULT 0,       -- estimated interest per month (e.g. Nizam)
-    interest_days    TEXT NOT NULL DEFAULT '',       -- due days each month, e.g. "20,30"
-    status           TEXT NOT NULL DEFAULT 'paying'
-                     CHECK (status IN ('paying','not_decided','not_possible','closed')),
-    start_month      TEXT,                          -- YYYY-MM the schedule starts
-    notes            TEXT NOT NULL DEFAULT '',
-    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-
-  -- Logged interest payments (variable amount), e.g. Nizam's card twice a month.
-  CREATE TABLE IF NOT EXISTS interest_payments (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    debt_id   INTEGER NOT NULL REFERENCES debts(id) ON DELETE CASCADE,
-    amount    REAL NOT NULL,
-    date      TEXT NOT NULL,
-    note      TEXT NOT NULL DEFAULT ''
-  );
-
-  -- Recurring monthly outflows that are NOT amortizing EMIs (rent, subscriptions…)
-  CREATE TABLE IF NOT EXISTS recurring (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    label       TEXT NOT NULL,
-    amount      REAL NOT NULL,
-    currency    TEXT NOT NULL DEFAULT 'INR',
-    category    TEXT NOT NULL DEFAULT 'General',
-    start_month TEXT NOT NULL,            -- YYYY-MM
-    end_month   TEXT,                     -- YYYY-MM, null = ongoing
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-
-  -- Payments made against a debt (reduces 'remaining')
-  CREATE TABLE IF NOT EXISTS payments (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    debt_id   INTEGER NOT NULL REFERENCES debts(id) ON DELETE CASCADE,
-    amount    REAL NOT NULL,
-    date      TEXT NOT NULL,
-    note      TEXT NOT NULL DEFAULT ''
-  );
-`);
-
-// --- migrate an older entries table (type/no currency) to the new schema ---
-const cols = db.prepare("PRAGMA table_info(entries)").all().map((c) => c.name);
-const dcols = db.prepare("PRAGMA table_info(debts)").all().map((c) => c.name);
-if (dcols.length && !dcols.includes('interest_days')) {
-  db.exec("ALTER TABLE debts ADD COLUMN interest_days TEXT NOT NULL DEFAULT ''");
-}
-if (cols.length && !cols.includes('recv_currency')) {
-  db.exec("ALTER TABLE entries ADD COLUMN recv_currency TEXT NOT NULL DEFAULT 'INR'");
-  db.exec("UPDATE entries SET recv_currency = currency");
-}
-if (cols.includes('type') && !cols.includes('kind')) {
-  db.exec(`
-    ALTER TABLE entries RENAME TO entries_old;
-    CREATE TABLE entries (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      kind TEXT NOT NULL DEFAULT 'income' CHECK (kind IN ('income','expense','transfer')),
-      currency TEXT NOT NULL DEFAULT 'INR',
-      category TEXT NOT NULL DEFAULT 'General',
-      narrative TEXT NOT NULL DEFAULT '',
-      amount REAL NOT NULL,
-      rate REAL NOT NULL DEFAULT 0,
-      date TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    INSERT INTO entries (id, kind, currency, category, narrative, amount, rate, date, created_at)
-      SELECT id, type, 'INR', category, narrative, amount, 0, date, created_at FROM entries_old;
-    DROP TABLE entries_old;
-  `);
+if (PG) {
+  pool = new pg.Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }, // Supabase requires SSL
+  });
+} else {
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  sdb = new Database(join(__dirname, 'finance.db'));
+  sdb.pragma('journal_mode = WAL');
+  sdb.pragma('foreign_keys = ON');
 }
 
-export default db;
+// Run a query. Returns rows for SELECT / RETURNING, [] otherwise.
+export async function q(text, params = []) {
+  if (PG) return (await pool.query(text, params)).rows;
+  const sql = text.replace(/\$(\d+)/g, '?'); // positional, no reused placeholders
+  const stmt = sdb.prepare(sql);
+  if (/returning|^\s*select|^\s*with|^\s*pragma/i.test(text)) return stmt.all(...params);
+  stmt.run(...params);
+  return [];
+}
+export const one = async (text, params) => (await q(text, params))[0];
+
+// --- schema (portable across both drivers) ---
+const ID = PG ? 'BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT';
+const NOW = PG ? 'now()' : "datetime('now')";
+
+export async function init() {
+  await q(`CREATE TABLE IF NOT EXISTS entries (
+    id ${ID},
+    kind TEXT NOT NULL DEFAULT 'income' CHECK (kind IN ('income','expense','transfer')),
+    currency TEXT NOT NULL DEFAULT 'INR',
+    recv_currency TEXT NOT NULL DEFAULT 'INR',
+    category TEXT NOT NULL DEFAULT 'General',
+    narrative TEXT NOT NULL DEFAULT '',
+    amount REAL NOT NULL,
+    rate REAL NOT NULL DEFAULT 0,
+    date TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (${NOW})
+  )`);
+
+  await q(`CREATE TABLE IF NOT EXISTS debts (
+    id ${ID},
+    source TEXT NOT NULL,
+    direction TEXT NOT NULL DEFAULT 'payable' CHECK (direction IN ('payable','receivable')),
+    remaining REAL NOT NULL,
+    emi REAL DEFAULT 0,
+    remaining_months INTEGER DEFAULT 0,
+    currency TEXT NOT NULL DEFAULT 'INR',
+    monthly_interest REAL NOT NULL DEFAULT 0,
+    interest_days TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'paying' CHECK (status IN ('paying','not_decided','not_possible','closed')),
+    start_month TEXT,
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (${NOW})
+  )`);
+
+  await q(`CREATE TABLE IF NOT EXISTS payments (
+    id ${ID},
+    debt_id INTEGER NOT NULL REFERENCES debts(id) ON DELETE CASCADE,
+    amount REAL NOT NULL,
+    date TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT ''
+  )`);
+
+  await q(`CREATE TABLE IF NOT EXISTS interest_payments (
+    id ${ID},
+    debt_id INTEGER NOT NULL REFERENCES debts(id) ON DELETE CASCADE,
+    amount REAL NOT NULL,
+    date TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT ''
+  )`);
+
+  await q(`CREATE TABLE IF NOT EXISTS recurring (
+    id ${ID},
+    label TEXT NOT NULL,
+    amount REAL NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'INR',
+    category TEXT NOT NULL DEFAULT 'General',
+    start_month TEXT NOT NULL,
+    end_month TEXT,
+    created_at TEXT NOT NULL DEFAULT (${NOW})
+  )`);
+
+  // SQLite-only migrations for pre-existing finance.db files (Postgres starts fresh).
+  if (!PG) {
+    const ecols = sdb.prepare('PRAGMA table_info(entries)').all().map((c) => c.name);
+    if (ecols.length && !ecols.includes('recv_currency')) {
+      sdb.exec("ALTER TABLE entries ADD COLUMN recv_currency TEXT NOT NULL DEFAULT 'INR'");
+      sdb.exec('UPDATE entries SET recv_currency = currency');
+    }
+    const dcols = sdb.prepare('PRAGMA table_info(debts)').all().map((c) => c.name);
+    if (dcols.length && !dcols.includes('interest_days')) {
+      sdb.exec("ALTER TABLE debts ADD COLUMN interest_days TEXT NOT NULL DEFAULT ''");
+    }
+  }
+}
