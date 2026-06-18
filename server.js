@@ -41,6 +41,24 @@ function debtView(debt) {
   return { ...debt, schedule: scheduleFor(debt) };
 }
 
+// All monthly commitments due in a given month (EMIs + debt interest + recurring).
+function commitmentsForMonth(ym, debts, recurrings) {
+  const items = [];
+  const now = thisMonth();
+  for (const d of debts) {
+    if (d.status === 'closed') continue;
+    const se = (d.schedule || scheduleFor(d)).find((s) => s.month === ym);
+    if (se) items.push({ label: d.source, amount: se.amount, currency: d.currency, type: 'emi' });
+    if (d.monthly_interest > 0 && ym >= now)
+      items.push({ label: d.source + ' (interest)', amount: d.monthly_interest, currency: d.currency, type: 'interest' });
+  }
+  for (const r of recurrings) {
+    if (r.start_month <= ym && (!r.end_month || ym <= r.end_month))
+      items.push({ label: r.label, amount: r.amount, currency: r.currency, type: 'recurring' });
+  }
+  return items;
+}
+
 // ---- entries (income / expense) -------------------------------------------
 
 // Amount actually credited/debited, in the RECEIVED currency.
@@ -214,6 +232,35 @@ app.post('/api/debts/import', wrap((req, res) => {
   res.json({ imported });
 }));
 
+// ---- recurring expenses ----------------------------------------------------
+
+app.get('/api/recurring', wrap((req, res) => {
+  res.json(db.prepare('SELECT * FROM recurring ORDER BY start_month, label').all());
+}));
+
+app.post('/api/recurring', wrap((req, res) => {
+  const { label, amount, currency, category, start_month, end_month } = req.body;
+  if (!label) throw new Error('Label required');
+  if (!(amount > 0)) throw new Error('Amount must be positive');
+  if (!start_month) throw new Error('Start month required');
+  const info = db.prepare(
+    'INSERT INTO recurring (label, amount, currency, category, start_month, end_month) VALUES (?,?,?,?,?,?)'
+  ).run(label, amount, currency || 'INR', category || 'General', start_month, end_month || null);
+  res.json(db.prepare('SELECT * FROM recurring WHERE id = ?').get(info.lastInsertRowid));
+}));
+
+app.delete('/api/recurring/:id', wrap((req, res) => {
+  db.prepare('DELETE FROM recurring WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+}));
+
+// commitments (EMI + interest + recurring) for a specific month
+app.get('/api/commitments/:month', wrap((req, res) => {
+  const debts = db.prepare('SELECT * FROM debts').all().map(debtView);
+  const recur = db.prepare('SELECT * FROM recurring').all();
+  res.json(commitmentsForMonth(req.params.month, debts, recur));
+}));
+
 // ---- payments --------------------------------------------------------------
 
 app.get('/api/debts/:id/payments', wrap((req, res) => {
@@ -275,13 +322,18 @@ app.get('/api/summary', wrap((req, res) => {
     if (d.status === 'paying') c.emi += d.emi;
   }
 
-  // aggregate the EMI schedule per month per currency
+  // aggregate ALL commitments (EMI + interest + recurring) per month per currency,
+  // over a 12-month horizon starting this month.
+  const recur = db.prepare('SELECT * FROM recurring').all();
   const sched = {}; // month -> {INR, AED}
-  for (const d of active) {
-    for (const s of d.schedule) {
-      const m = (sched[s.month] = sched[s.month] || {});
-      m[d.currency] = (m[d.currency] || 0) + s.amount;
+  let ym = thisMonth();
+  for (let i = 0; i < 12; i++) {
+    const items = commitmentsForMonth(ym, debts, recur);
+    if (items.length) {
+      const m = (sched[ym] = sched[ym] || {});
+      for (const it of items) m[it.currency] = (m[it.currency] || 0) + it.amount;
     }
+    ym = addMonths(ym, 1);
   }
 
   const statusCounts = active.reduce((a, d) => { a[d.status] = (a[d.status] || 0) + 1; return a; }, {});

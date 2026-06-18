@@ -43,6 +43,18 @@ db.exec(`
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  -- Recurring monthly outflows that are NOT amortizing EMIs (rent, subscriptions…)
+  CREATE TABLE IF NOT EXISTS recurring (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    label       TEXT NOT NULL,
+    amount      REAL NOT NULL,
+    currency    TEXT NOT NULL DEFAULT 'INR',
+    category    TEXT NOT NULL DEFAULT 'General',
+    start_month TEXT NOT NULL,            -- YYYY-MM
+    end_month   TEXT,                     -- YYYY-MM, null = ongoing
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   -- Payments made against a debt (reduces 'remaining')
   CREATE TABLE IF NOT EXISTS payments (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -60,7 +60,8 @@ async function render() {
 // ---------- Dashboard ----------
 views.dashboard = async () => {
   const s = await api('/api/summary');
-  const cur = Object.keys(s.byCurrency);
+  const cur = [...new Set([...Object.keys(s.byCurrency), ...Object.values(s.schedule).flatMap((m) => Object.keys(m))])];
+  if (!cur.length) cur.push('INR');
   const months = {};
   s.monthly.forEach((m) => { months[m.month] = months[m.month] || { income: 0, expense: 0 }; months[m.month][m.type] = m.total; });
   const monthKeys = Object.keys(months).sort().slice(-6);
@@ -81,10 +82,10 @@ views.dashboard = async () => {
     </div>
 
     <div class="panel">
-      <h3>EMI outflow — next 6 months</h3>
+      <h3>Monthly commitments — next 6 months <span class="muted" style="font-size:.8rem;font-weight:400;">EMIs + interest + recurring</span></h3>
       ${schedMonths.length ? `<table><thead><tr><th>Month</th>${cur.map((c) => `<th class="right">${c}</th>`).join('')}</tr></thead><tbody>
         ${schedMonths.map((m) => `<tr><td>${fmtMonth(m)}</td>${cur.map((c) => `<td class="right">${s.schedule[m][c] ? money(s.schedule[m][c], c) : '—'}</td>`).join('')}</tr>`).join('')}
-      </tbody></table>` : '<p class="empty">No EMI schedule yet. Add paying debts with an EMI &amp; months.</p>'}
+      </tbody></table>` : '<p class="empty">No commitments yet. Add paying debts or recurring expenses.</p>'}
     </div>
 
     <div class="panel">
@@ -204,7 +205,7 @@ views.ledger = async () => {
 
 // ---------- Debts ----------
 views.debts = async () => {
-  const debts = await api('/api/debts');
+  const [debts, recurring] = await Promise.all([api('/api/debts'), api('/api/recurring')]);
   const groups = { paying: [], not_decided: [], not_possible: [], closed: [] };
   debts.forEach((d) => groups[d.status].push(d));
 
@@ -232,10 +233,38 @@ views.debts = async () => {
         <button class="btn" id="add-btn">+ Add debt</button>
       </div></div>
     ${debts.length ? '' : '<p class="empty">No debts yet. Add one or import your CSV.</p>'}
-    ${section('paying')}${section('not_decided')}${section('not_possible')}${section('closed')}`;
+    ${section('paying')}${section('not_decided')}${section('not_possible')}${section('closed')}
+
+    <div class="panel">
+      <div class="panel-head"><h3 style="margin:0;">Recurring monthly expenses <span class="muted" style="font-size:.8rem;font-weight:400;">rent, subscriptions…</span></h3></div>
+      <form class="grid" id="recur-form">
+        <label class="field" style="grid-column: span 2;">Label<input name="label" placeholder="House rent, Netflix…" required /></label>
+        <label class="field">Currency<select name="currency"><option value="INR">₹ INR</option><option value="AED">AED</option></select></label>
+        <label class="field">Amount<input name="amount" type="number" step="0.01" min="0" required /></label>
+        <label class="field">Starts<input name="start_month" type="month" value="${thisMonth()}" required /></label>
+        <label class="field">Ends (optional)<input name="end_month" type="month" /></label>
+        <button class="btn" type="submit">Add</button>
+      </form>
+      ${recurring.length ? `<table style="margin-top:16px;"><thead><tr><th>Label</th><th class="right">Amount</th><th>From</th><th>To</th><th></th></tr></thead><tbody>
+        ${recurring.map((r) => `<tr><td>${esc(r.label)}</td><td class="right">${money(r.amount, r.currency)}/mo</td>
+          <td>${fmtMonth(r.start_month)}</td><td>${r.end_month ? fmtMonth(r.end_month) : 'ongoing'}</td>
+          <td class="right"><button class="btn danger" data-del-r="${r.id}">✕</button></td></tr>`).join('')}
+      </tbody></table>` : '<p class="muted" style="margin-top:12px;">None yet. Add your upcoming house rent here so it shows in monthly commitments.</p>'}
+    </div>`;
 
   $('#add-btn').onclick = () => debtModal();
   $('#import-btn').onclick = importModal;
+  $('#recur-form').onsubmit = async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    await api('/api/recurring', { method: 'POST', body: {
+      label: f.get('label'), currency: f.get('currency'), amount: parseFloat(f.get('amount')),
+      start_month: f.get('start_month'), end_month: f.get('end_month') || null } });
+    render();
+  };
+  app.querySelectorAll('[data-del-r]').forEach((b) => b.onclick = async () => {
+    if (confirm('Delete this recurring expense?')) { await api('/api/recurring/' + b.dataset.delR, { method: 'DELETE' }); render(); }
+  });
   app.querySelectorAll('[data-pay]').forEach((b) => b.onclick = () => payModal(debts.find((d) => d.id == b.dataset.pay)));
   app.querySelectorAll('[data-edit]').forEach((b) => b.onclick = () => debtModal(debts.find((d) => d.id == b.dataset.edit)));
   app.querySelectorAll('[data-del-d]').forEach((b) => b.onclick = async () => {
@@ -318,33 +347,32 @@ function importModal() {
   });
 }
 
-// ---------- Calendar ----------
+// ---------- Calendar (monthly commitments) ----------
 let calRef = new Date();
+const TYPE_TAG = {
+  emi: '<span class="pill" style="background:rgba(79,156,249,.18);color:var(--accent)">EMI</span>',
+  interest: '<span class="pill overdue">interest</span>',
+  recurring: '<span class="pill soon">recurring</span>',
+};
 views.calendar = async () => {
-  const debts = await api('/api/debts');
-  const events = {}; // YYYY-MM -> [{source, amount, currency}]
-  debts.forEach((d) => d.schedule.forEach((s) => {
-    (events[s.month] = events[s.month] || []).push({ source: d.source, amount: s.amount, currency: d.currency });
-  }));
-
   const y = calRef.getFullYear(), m = calRef.getMonth();
   const ym = `${y}-${String(m + 1).padStart(2, '0')}`;
   const monthName = calRef.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
-  const evs = events[ym] || [];
-  const tot = evs.reduce((a, e) => { a[e.currency] = (a[e.currency] || 0) + e.amount; return a; }, {});
+  const items = await api('/api/commitments/' + ym);
+  const tot = items.reduce((a, e) => { a[e.currency] = (a[e.currency] || 0) + e.amount; return a; }, {});
 
   app.innerHTML = `
-    <h2>Payment Calendar</h2>
+    <h2>Monthly Commitments</h2>
     <div class="panel">
       <div class="panel-head">
         <button class="btn ghost small" id="prev">← Prev</button>
         <h3 style="margin:0;">${monthName}</h3>
         <button class="btn ghost small" id="next">Next →</button>
       </div>
-      ${evs.length ? `<table><thead><tr><th>Source</th><th class="right">EMI due</th></tr></thead><tbody>
-        ${evs.map((e) => `<tr><td>${esc(e.source)}</td><td class="right">${money(e.amount, e.currency)}</td></tr>`).join('')}
-        <tr><td><b>Total</b></td><td class="right"><b>${Object.entries(tot).map(([c, v]) => money(v, c)).join(' + ')}</b></td></tr>
-      </tbody></table>` : '<p class="empty">No EMIs scheduled this month.</p>'}
+      ${items.length ? `<table><thead><tr><th>What</th><th>Type</th><th class="right">Due</th></tr></thead><tbody>
+        ${items.map((e) => `<tr><td>${esc(e.label)}</td><td>${TYPE_TAG[e.type] || ''}</td><td class="right">${money(e.amount, e.currency)}</td></tr>`).join('')}
+        <tr><td colspan="2"><b>Total due this month</b></td><td class="right"><b>${Object.entries(tot).map(([c, v]) => money(v, c)).join(' + ') || '—'}</b></td></tr>
+      </tbody></table>` : '<p class="empty">Nothing due this month.</p>'}
     </div>`;
   $('#prev').onclick = () => { calRef = new Date(y, m - 1, 1); render(); };
   $('#next').onclick = () => { calRef = new Date(y, m + 1, 1); render(); };
