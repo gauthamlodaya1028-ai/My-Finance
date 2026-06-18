@@ -43,31 +43,46 @@ function debtView(debt) {
 
 // ---- entries (income / expense) -------------------------------------------
 
-// INR-equivalent of an entry (for reporting). AED amount uses its rate; INR is itself.
+// Amount actually credited/debited, in the RECEIVED currency.
+function recvAmount(e) {
+  const from = e.currency, to = e.recv_currency || e.currency;
+  if (from === to) return e.amount;
+  if (from === 'INR' && to === 'AED') return e.rate ? e.amount / e.rate : 0;
+  if (from === 'AED' && to === 'INR') return e.amount * e.rate;
+  return e.amount;
+}
+// INR-equivalent of an entry (for reporting/chart).
 function inrValue(e) {
   if (e.kind === 'transfer') return e.amount * e.rate;       // AED -> INR received
-  return e.currency === 'AED' && e.rate ? e.amount * e.rate : (e.currency === 'INR' ? e.amount : 0);
+  const to = e.recv_currency || e.currency;
+  if (to === 'INR') return recvAmount(e);
+  // landed in AED -> INR-equivalent: the INR figure behind it
+  if (e.currency === 'INR') return e.amount;                 // decided in INR
+  return e.rate ? e.amount * e.rate : 0;                     // AED with a known rate
 }
-const entryView = (e) => ({ ...e, inr_value: inrValue(e) });
+const entryView = (e) => ({ ...e, recv_amount: recvAmount(e), inr_value: inrValue(e) });
 
 app.get('/api/entries', wrap((req, res) => {
   res.json(db.prepare('SELECT * FROM entries ORDER BY date DESC, id DESC').all().map(entryView));
 }));
 
 app.post('/api/entries', wrap((req, res) => {
-  const { kind, currency, category, narrative, amount, rate, date } = req.body;
+  const { kind, currency, recv_currency, category, narrative, amount, rate, date } = req.body;
   if (!['income', 'expense', 'transfer'].includes(kind)) throw new Error('Invalid kind');
   if (!(amount > 0)) throw new Error('Amount must be positive');
   if (!date) throw new Error('Date required');
   let cur = currency || 'INR';
+  let recv = recv_currency || cur;
   let rt = Number(rate) || 0;
   if (kind === 'transfer') {                       // AED -> INR, rate required
-    cur = 'AED';
+    cur = 'AED'; recv = 'INR';
     if (!(rt > 0)) throw new Error('Transfer needs an exchange rate (₹/AED)');
+  } else if (cur !== recv && !(rt > 0)) {
+    throw new Error('A rate (₹/AED) is required when "Amount in" and "Received in" differ');
   }
   const info = db.prepare(
-    'INSERT INTO entries (kind, currency, category, narrative, amount, rate, date) VALUES (?,?,?,?,?,?,?)'
-  ).run(kind, cur, category || 'General', narrative || '', amount, rt, date);
+    'INSERT INTO entries (kind, currency, recv_currency, category, narrative, amount, rate, date) VALUES (?,?,?,?,?,?,?,?)'
+  ).run(kind, cur, recv, category || 'General', narrative || '', amount, rt, date);
   res.json(entryView(db.prepare('SELECT * FROM entries WHERE id = ?').get(info.lastInsertRowid)));
 }));
 
@@ -235,11 +250,12 @@ app.get('/api/summary', wrap((req, res) => {
   const bal = { INR: 0, AED: 0 };
   let incomeINR = 0, expenseINR = 0;           // INR-equivalent totals for the chart/cards
   for (const e of all) {
+    const to = e.recv_currency || e.currency;
     if (e.kind === 'income') {
-      bal[e.currency] = (bal[e.currency] || 0) + e.amount;
+      bal[to] = (bal[to] || 0) + recvAmount(e);
       incomeINR += inrValue(e);
     } else if (e.kind === 'expense') {
-      bal[e.currency] = (bal[e.currency] || 0) - e.amount;
+      bal[to] = (bal[to] || 0) - recvAmount(e);
       expenseINR += inrValue(e);
     } else if (e.kind === 'transfer') {          // AED -> INR
       bal.AED -= e.amount;
@@ -295,8 +311,9 @@ function buildContext() {
   const debts = db.prepare('SELECT * FROM debts').all().map(debtView);
   const bal = { INR: 0, AED: 0 };
   for (const e of db.prepare('SELECT * FROM entries').all()) {
-    if (e.kind === 'income') bal[e.currency] += e.amount;
-    else if (e.kind === 'expense') bal[e.currency] -= e.amount;
+    const to = e.recv_currency || e.currency;
+    if (e.kind === 'income') bal[to] += recvAmount(e);
+    else if (e.kind === 'expense') bal[to] -= recvAmount(e);
     else if (e.kind === 'transfer') { bal.AED -= e.amount; bal.INR += e.amount * e.rate; }
   }
   return JSON.stringify({

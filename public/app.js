@@ -112,8 +112,10 @@ views.ledger = async () => {
       return `<span style="color:var(--accent)">${money(e.amount, 'AED')} → ${money(e.amount * e.rate, 'INR')}</span> <span class="muted">@${e.rate}</span>`;
     const sign = e.kind === 'income' ? '+' : '−';
     const col = e.kind === 'income' ? 'var(--green)' : 'var(--red)';
-    const equiv = e.currency === 'AED' && e.rate ? ` <span class="muted">≈ ${money(e.amount * e.rate, 'INR')} @${e.rate}</span>` : '';
-    return `<span style="color:${col}">${sign}${money(e.amount, e.currency)}</span>${equiv}`;
+    const recv = e.recv_currency || e.currency;
+    if (e.currency !== recv) // converted: show entered -> received
+      return `<span style="color:${col}">${sign}${money(e.recv_amount, recv)}</span> <span class="muted">(${money(e.amount, e.currency)} @${e.rate})</span>`;
+    return `<span style="color:${col}">${sign}${money(e.amount, e.currency)}</span>`;
   };
 
   app.innerHTML = `
@@ -132,12 +134,14 @@ views.ledger = async () => {
             <option value="expense">Expense</option>
             <option value="transfer">Transfer AED → INR</option>
           </select></label>
-        <label class="field" id="cur-field">Currency
+        <label class="field" id="cur-field">Amount in
           <select name="currency"><option value="INR">₹ INR</option><option value="AED">AED</option></select></label>
-        <label class="field">Category<input name="category" placeholder="Salary, Incentive, Food, Rent…" /></label>
-        <label class="field" style="grid-column: span 2;">Narrative<input name="narrative" placeholder="e.g. June salary / Dubai side gig" /></label>
+        <label class="field" id="recv-field">Received in
+          <select name="recv_currency"><option value="INR">₹ INR</option><option value="AED">AED</option></select></label>
         <label class="field" id="amt-field">Amount<input name="amount" type="number" step="0.0001" min="0" required /></label>
         <label class="field" id="rate-field">Rate (₹/AED)<input name="rate" type="number" step="0.0001" min="0" placeholder="optional" /></label>
+        <label class="field">Category<input name="category" placeholder="Salary, Incentive, Food, Rent…" /></label>
+        <label class="field" style="grid-column: span 2;">Narrative<input name="narrative" placeholder="e.g. June salary / Dubai side gig" /></label>
         <label class="field">Date<input name="date" type="date" value="${today()}" required /></label>
         <button class="btn" type="submit">Add</button>
       </form>
@@ -158,32 +162,38 @@ views.ledger = async () => {
 
   const kindSel = $('#kind-sel');
   const curField = $('#cur-field');
-  const rateLabel = $('#rate-field');
+  const recvField = $('#recv-field');
+  const rateField = $('#rate-field');
+  const curSel = $('select[name=currency]');
+  const recvSel = $('select[name=recv_currency]');
   const hint = $('#entry-hint');
   const syncForm = () => {
     const k = kindSel.value;
-    const cur = $('select[name=currency]').value;
-    curField.style.display = k === 'transfer' ? 'none' : '';
-    rateLabel.querySelector('input').required = k === 'transfer';
-    if (k === 'transfer') {
-      rateLabel.querySelector('span, label')?.remove();
+    const isTransfer = k === 'transfer';
+    curField.style.display = isTransfer ? 'none' : '';
+    recvField.style.display = isTransfer ? 'none' : '';
+    const differ = !isTransfer && curSel.value !== recvSel.value;
+    rateField.style.display = (isTransfer || differ) ? '' : 'none';
+    rateField.querySelector('input').required = isTransfer || differ;
+    if (isTransfer) {
       hint.textContent = 'Transfer: enter AED to send + the exchange rate. It subtracts AED and adds AED×rate to your INR balance.';
-    } else if (cur === 'AED') {
-      hint.textContent = 'AED income/expense. Add the receive rate to record the ₹-equivalent (AED × rate). e.g. salary 3320.75 AED @ 26.5 = ₹88,000.';
+    } else if (differ && curSel.value === 'INR') {
+      hint.textContent = 'Decided in INR, received in AED. Enter the INR figure + rate → it credits AED = INR ÷ rate. e.g. ₹88,000 @ 26.5 = AED 3,320.75.';
+    } else if (differ) {
+      hint.textContent = 'Entered in AED, received in INR. It credits INR = AED × rate.';
     } else {
-      hint.textContent = 'INR income/expense credited/debited directly to your INR balance.';
+      hint.textContent = `${curSel.value} ${k} credited/debited directly to your ${curSel.value} balance.`;
     }
   };
-  kindSel.onchange = syncForm;
-  $('select[name=currency]').onchange = syncForm;
+  [kindSel, curSel, recvSel].forEach((el) => el.onchange = syncForm);
   syncForm();
 
   $('#entry-form').onsubmit = async (ev) => {
     ev.preventDefault();
     const f = new FormData(ev.target);
     await api('/api/entries', { method: 'POST', body: {
-      kind: f.get('kind'), currency: f.get('currency'), category: f.get('category'),
-      narrative: f.get('narrative'), amount: parseFloat(f.get('amount')),
+      kind: f.get('kind'), currency: f.get('currency'), recv_currency: f.get('recv_currency'),
+      category: f.get('category'), narrative: f.get('narrative'), amount: parseFloat(f.get('amount')),
       rate: parseFloat(f.get('rate')) || 0, date: f.get('date') } });
     render();
   };

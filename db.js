@@ -16,7 +16,8 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS entries (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT NOT NULL DEFAULT 'income' CHECK (kind IN ('income','expense','transfer')),
-    currency    TEXT NOT NULL DEFAULT 'INR',
+    currency    TEXT NOT NULL DEFAULT 'INR',  -- currency the amount is entered in
+    recv_currency TEXT NOT NULL DEFAULT 'INR', -- currency it lands in (balance credited)
     category    TEXT NOT NULL DEFAULT 'General',
     narrative   TEXT NOT NULL DEFAULT '',
     amount      REAL NOT NULL,
@@ -54,6 +55,10 @@ db.exec(`
 
 // --- migrate an older entries table (type/no currency) to the new schema ---
 const cols = db.prepare("PRAGMA table_info(entries)").all().map((c) => c.name);
+if (cols.length && !cols.includes('recv_currency')) {
+  db.exec("ALTER TABLE entries ADD COLUMN recv_currency TEXT NOT NULL DEFAULT 'INR'");
+  db.exec("UPDATE entries SET recv_currency = currency");
+}
 if (cols.includes('type') && !cols.includes('kind')) {
   db.exec(`
     ALTER TABLE entries RENAME TO entries_old;
