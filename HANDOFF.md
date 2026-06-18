@@ -153,55 +153,50 @@ The owner's **Earning** CSV is a key-value layout (not rows) — **no importer b
 
 ---
 
-## 8. ★ Chat assistant — and why it breaks when hosted
+## 8. Chat assistant (`POST /api/chat`)
 
-`POST /api/chat` builds a context blob (balances + debts + recent entries) and **spawns the
-local `claude` CLI** (`claude -p`). This uses the **owner's Claude Max subscription**, so it is
-free of API cost — BUT it only works on a machine where the `claude` CLI is installed and logged in.
+Builds a context blob (balances + debts + recent entries) and asks Claude. Three auth
+paths, chosen by env (see [.env.example](.env.example)); the boot log prints which one
+(`chat=api|oauth|cli`):
 
-**When you host this on a server, the CLI path will NOT work.** Choose one:
-- **(A) Anthropic API** — replace the `spawn('claude', ['-p'])` block with an Anthropic SDK call
-  using `ANTHROPIC_API_KEY` (paid per token). Model id e.g. `claude-opus-4-8` or a cheaper Sonnet/Haiku.
-- **(B) Disable chat in production** — guard the route behind an env flag and hide the FAB.
-- **(C) Self-host the CLI** — only if your host lets you install + auth the `claude` CLI (most don't).
+1. **`ANTHROPIC_API_KEY`** set → Anthropic API via `@anthropic-ai/sdk`, model `CHAT_MODEL`
+   (default `claude-opus-4-8`; owner picked `claude-sonnet-4-6`). Pay-per-use, reliable on a server.
+2. **`ANTHROPIC_AUTH_TOKEN`** set → OAuth bearer token + `anthropic-beta: oauth-2025-04-20`.
+   ⚠️ short-lived (~1h), **not auto-refreshed here** — only useful for short sessions.
+3. **Neither set → spawns the local `claude` CLI** (`claude -p`). This is the owner's chosen
+   path for hosting: the CLI holds a **refresh token** and renews OAuth itself, so it "stays
+   logged in" indefinitely on a subscription account. Selectable via:
+   - `CLAUDE_BIN` — absolute path if `claude` isn't on PATH.
+   - `CLAUDE_CONFIG_DIR` — which logged-in account/subscription to use (isolates the app's
+     chat account from any other login on the host).
 
-Recommended for hosting: **(A)** with a small/cheap model, or **(B)** if cost matters.
+> The owner runs the CLI on a host already (30+ days). To put a specific subscription account
+> behind the app: `CLAUDE_CONFIG_DIR=DIR claude` → `/login` once (browser), copy `DIR` to the
+> host, set `CLAUDE_CONFIG_DIR`. See [DEPLOY.md](DEPLOY.md) → "Chat via a subscription".
+> **Do NOT** automate/scrape claude.ai in a browser/Electron — against Anthropic's terms,
+> brittle, and risks the account. OAuth/CLI is the sanctioned "log in once, persists" path.
 
 ---
 
-## 9. ★ Hosting plan (Supabase + a Node host)
+## 9. Hosting — already built (dual-mode), pending verification
 
-A Supabase project already exists (owner created it). To go live:
+The app is **deploy-ready** and switches behavior by env var. Full steps: **[DEPLOY.md](DEPLOY.md)**.
 
-### 9.1 Move the DB from SQLite → Supabase Postgres
-1. Get the Supabase **connection string** (Project → Settings → Database → Connection string / URI)
-   and/or the **service-role key** + project URL.
-2. Recreate the 5 tables in Postgres. SQL is a near-direct port; differences to handle:
-   - `INTEGER PRIMARY KEY AUTOINCREMENT` → `BIGINT GENERATED ALWAYS AS IDENTITY` (or `serial`).
-   - `datetime('now')` defaults → `now()`.
-   - `substr(date,1,7)` (used in the summary chart) → `to_char(date::date,'YYYY-MM')` or `left(date,7)`.
-   - Keep `date`/month fields as `text` (app stores `YYYY-MM-DD` / `YYYY-MM`) to minimise churn,
-     or migrate to real `date` and update the few string comparisons.
-3. Swap the data layer: replace `better-sqlite3` with either
-   - the **`pg`** client / **`postgres`** lib using the connection string, **or**
-   - the **`@supabase/supabase-js`** client.
-   Centralise this in `db.js`; the route handlers mostly do simple queries.
-   ⚠️ `better-sqlite3` is **synchronous**; Postgres clients are **async**. Every `db.prepare(...).get/all/run`
-   becomes `await`. The route handlers already use the `wrap()` helper which supports async — good.
-4. Set env vars on the host: `DATABASE_URL` (and `ANTHROPIC_API_KEY` if using chat path A).
+- **DB**: SQLite locally; Supabase **Postgres** when `DATABASE_URL` is set. One async layer in
+  [db.js](db.js) (`q`/`one`, `$N` placeholders, portable schema, SSL on the pool). Schema
+  auto-creates on boot via `init()`.
+- **Data migration**: [migrate-to-postgres.js](migrate-to-postgres.js) copies the local
+  `finance.db` rows into Supabase (ids preserved, sequences fixed). Run once with `DATABASE_URL` set.
+- **Auth**: Supabase Auth (magic link) when `SUPABASE_URL` is set; **off** locally. Backend
+  verifies the JWT on every `/api` route except `/api/config` + `/api/health`; restricted to
+  `ALLOWED_EMAIL`. Frontend gate in [public/app.js](public/app.js) (`boot()` / `showLogin`).
+- **Host**: Hostinger "Node.js Web App" from GitHub (owner has Cloud Startup). Supabase is only
+  DB+auth; Hostinger runs the Node server. App reads `process.env.PORT`.
 
-### 9.2 Pick a host
-- The frontend is static; the backend is a small Express app. Any Node host works
-  (Render, Railway, Fly.io, a VPS). **Supabase itself does not run your Node server** —
-  it's only the database (and optionally auth/storage). So: Node host + Supabase Postgres.
-- Set `PORT` from env (already supported: `process.env.PORT || 3000`).
-
-### 9.3 Add auth before exposing it publicly
-Right now there is **no authentication** — anyone with the URL sees/edits all data.
-This is fine on localhost, **not** fine when hosted. Options:
-- Supabase Auth (email magic link) + Row Level Security, or
-- A simple single-user password / basic-auth middleware (fastest for one user).
-**Do not deploy publicly without this.**
+**Status (2026-06): owner is testing LOCALLY first** (SQLite + no auth + CLI chat). The Postgres +
+auth path is built but **not yet verified against the real Supabase** — that needs the owner's
+pooler `DATABASE_URL` (port 6543) and a one-time `migrate-to-postgres.js` run. Don't claim the
+PG path works until it's been run live.
 
 ---
 
@@ -211,9 +206,11 @@ This is fine on localhost, **not** fine when hosted. Options:
 - **Monthly earning summary** — per month: AED received / transferred / ₹ landed / blended rate.
 - **Streaming chat** replies.
 - **Edit** for ledger entries and recurring (currently add/delete only).
-- **Auth** (required before hosting — see §9.3).
 - **House rent** recurring expense: owner said AED 4,000 from December, but is relocating to India
   by ~November — currency/continuity was left undecided. Confirm before adding.
+- **Verify the Supabase Postgres + auth path live** (built, not yet run against real Supabase — see §9).
+
+(Auth, Postgres dual-mode, API/OAuth/CLI chat, CSV import, data-migration script — **built**.)
 
 ---
 
@@ -242,6 +239,9 @@ This is fine on localhost, **not** fine when hosted. Options:
 ## 13. Quick orientation for a new Claude session
 
 1. Read this file + [server.js](server.js) (logic) + [public/app.js](public/app.js) (UI).
-2. `npm install && npm start`, open http://localhost:3000.
-3. The chat needs the local `claude` CLI; if absent, that one feature is down (see §8).
-4. Before hosting: do §9 (Postgres swap + auth + chat path). Everything else already works locally.
+2. `npm install && npm start`, open http://localhost:3000. With no real env, runs **local mode**:
+   SQLite + no auth + chat via local `claude` CLI (boot log shows `[db=sqlite, auth=false, chat=cli]`).
+3. Chat needs the local `claude` CLI (or set `ANTHROPIC_API_KEY`); see §8.
+4. **Owner is testing locally right now.** When ready to host: fill `.env` and follow
+   [DEPLOY.md](DEPLOY.md) — the same code switches to Supabase Postgres + auth automatically.
+   A `.env` exists with empty values (harmless; reads as local mode).
