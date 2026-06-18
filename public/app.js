@@ -1,4 +1,4 @@
-// ---------- tiny helpers ----------
+// ---------- helpers ----------
 const $ = (sel, el = document) => el.querySelector(sel);
 const app = $('#app');
 const modalHost = $('#modal-host');
@@ -13,11 +13,17 @@ const api = async (url, opts) => {
   return r.json();
 };
 
-const money = (n) =>
-  '₹' + Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const CUR = { INR: '₹', AED: 'AED ' };
+const money = (n, c = 'INR') =>
+  (CUR[c] || '') + Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
 const today = () => new Date().toISOString().slice(0, 10);
-const fmtDate = (d) => (d ? new Date(d + 'T00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—');
+const thisMonth = () => new Date().toISOString().slice(0, 7);
+const fmtDate = (d) => (d ? new Date(d + 'T00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' }) : '—');
+const fmtMonth = (ym) => { const [y, m] = ym.split('-'); return new Date(y, m - 1).toLocaleDateString('en-IN', { month: 'short', year: '2-digit' }); };
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+const STATUS_LABEL = { paying: 'Paying', not_decided: 'Not decided', not_possible: 'Not possible', closed: 'Closed' };
+const STATUS_PILL = { paying: 'soon', not_decided: 'soon', not_possible: 'overdue', closed: 'closed' };
 
 // ---------- modal ----------
 function openModal(title, bodyHtml, onMount) {
@@ -38,7 +44,6 @@ function openModal(title, bodyHtml, onMount) {
 // ---------- routing ----------
 const views = {};
 let current = 'dashboard';
-
 document.querySelectorAll('.tab').forEach((t) =>
   t.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x === t));
@@ -46,7 +51,6 @@ document.querySelectorAll('.tab').forEach((t) =>
     render();
   })
 );
-
 async function render() {
   app.innerHTML = '<p class="empty">Loading…</p>';
   try { await views[current](); }
@@ -56,10 +60,14 @@ async function render() {
 // ---------- Dashboard ----------
 views.dashboard = async () => {
   const s = await api('/api/summary');
+  const cur = Object.keys(s.byCurrency);
   const months = {};
   s.monthly.forEach((m) => { months[m.month] = months[m.month] || { income: 0, expense: 0 }; months[m.month][m.type] = m.total; });
   const monthKeys = Object.keys(months).sort().slice(-6);
   const max = Math.max(1, ...monthKeys.flatMap((k) => [months[k].income, months[k].expense]));
+
+  // next 6 months EMI outflow
+  const schedMonths = Object.keys(s.schedule).sort().slice(0, 6);
 
   app.innerHTML = `
     <h2>Dashboard</h2>
@@ -67,21 +75,16 @@ views.dashboard = async () => {
       <div class="card"><div class="label">Total Income</div><div class="value green">${money(s.income)}</div></div>
       <div class="card"><div class="label">Total Expense</div><div class="value red">${money(s.expense)}</div></div>
       <div class="card"><div class="label">Cash Balance</div><div class="value ${s.balance >= 0 ? 'green' : 'red'}">${money(s.balance)}</div></div>
-      <div class="card"><div class="label">Owed to me (receivable)</div><div class="value green">${money(s.receivable)}</div></div>
-      <div class="card"><div class="label">I owe (payable)</div><div class="value red">${money(s.payable)}</div></div>
-      <div class="card"><div class="label">Net position</div><div class="value ${s.netWorthDelta >= 0 ? 'green' : 'red'}">${money(s.netWorthDelta)}</div></div>
+      ${cur.map((c) => `<div class="card"><div class="label">Debt outstanding (${c})</div>
+        <div class="value red">${money(s.byCurrency[c].remaining, c)}</div>
+        <div class="label" style="margin-top:6px;">EMI/mo ${money(s.byCurrency[c].emi, c)}${s.byCurrency[c].interest ? ' · interest ' + money(s.byCurrency[c].interest, c) : ''}</div></div>`).join('')}
     </div>
 
     <div class="panel">
-      <h3>Reminders — due soon &amp; overdue</h3>
-      ${s.reminders.length ? `<table><thead><tr><th>Who</th><th>Type</th><th>Due</th><th class="right">Outstanding</th><th></th></tr></thead><tbody>
-        ${s.reminders.map((d) => `<tr>
-          <td>${esc(d.counterparty)}</td>
-          <td><span class="pill ${d.direction}">${d.direction}</span></td>
-          <td>${fmtDate(d.due_date)} <span class="pill ${d.overdue ? 'overdue' : 'soon'}">${d.overdue ? 'OVERDUE' : 'due soon'}</span></td>
-          <td class="right">${money(d.outstanding)}</td>
-        </tr>`).join('')}
-      </tbody></table>` : '<p class="empty">Nothing due in the next 7 days. 🎉</p>'}
+      <h3>EMI outflow — next 6 months</h3>
+      ${schedMonths.length ? `<table><thead><tr><th>Month</th>${cur.map((c) => `<th class="right">${c}</th>`).join('')}</tr></thead><tbody>
+        ${schedMonths.map((m) => `<tr><td>${fmtMonth(m)}</td>${cur.map((c) => `<td class="right">${s.schedule[m][c] ? money(s.schedule[m][c], c) : '—'}</td>`).join('')}</tr>`).join('')}
+      </tbody></table>` : '<p class="empty">No EMI schedule yet. Add paying debts with an EMI &amp; months.</p>'}
     </div>
 
     <div class="panel">
@@ -90,14 +93,14 @@ views.dashboard = async () => {
         ${monthKeys.map((k) => `<div class="bar-col"><div class="bar-pair">
           <div class="bar inc" style="height:${(months[k].income / max) * 130}px" title="${money(months[k].income)}"></div>
           <div class="bar exp" style="height:${(months[k].expense / max) * 130}px" title="${money(months[k].expense)}"></div>
-        </div><div class="bar-label">${k.slice(2)}</div></div>`).join('')}
+        </div><div class="bar-label">${fmtMonth(k)}</div></div>`).join('')}
       </div>
       <div class="legend"><span><span class="dot inc"></span>Income</span><span><span class="dot exp"></span>Expense</span></div>`
       : '<p class="empty">Add some income/expense entries to see trends.</p>'}
     </div>`;
 };
 
-// ---------- Ledger (income/expense) ----------
+// ---------- Ledger ----------
 views.ledger = async () => {
   const entries = await api('/api/entries');
   app.innerHTML = `
@@ -107,39 +110,30 @@ views.ledger = async () => {
       <form class="grid" id="entry-form">
         <label class="field">Type
           <select name="type"><option value="income">Income</option><option value="expense">Expense</option></select></label>
-        <label class="field">Category
-          <input name="category" placeholder="Salary, Rent, Side gig…" /></label>
-        <label class="field" style="grid-column: span 2;">Narrative
-          <input name="narrative" placeholder="e.g. June salary + incentive" /></label>
-        <label class="field">Amount
-          <input name="amount" type="number" step="0.01" min="0" required /></label>
-        <label class="field">Date
-          <input name="date" type="date" value="${today()}" required /></label>
+        <label class="field">Category<input name="category" placeholder="Salary, Rent, Side gig…" /></label>
+        <label class="field" style="grid-column: span 2;">Narrative<input name="narrative" placeholder="e.g. June salary + incentive" /></label>
+        <label class="field">Amount<input name="amount" type="number" step="0.01" min="0" required /></label>
+        <label class="field">Date<input name="date" type="date" value="${today()}" required /></label>
         <button class="btn" type="submit">Add</button>
       </form>
     </div>
-
     <div class="panel">
       <h3>History</h3>
       ${entries.length ? `<table><thead><tr><th>Date</th><th>Type</th><th>Category</th><th>Narrative</th><th class="right">Amount</th><th></th></tr></thead><tbody>
         ${entries.map((e) => `<tr>
-          <td>${fmtDate(e.date)}</td>
-          <td><span class="pill ${e.type}">${e.type}</span></td>
-          <td>${esc(e.category)}</td>
-          <td class="muted">${esc(e.narrative)}</td>
+          <td>${fmtDate(e.date)}</td><td><span class="pill ${e.type}">${e.type}</span></td>
+          <td>${esc(e.category)}</td><td class="muted">${esc(e.narrative)}</td>
           <td class="right" style="color:${e.type === 'income' ? 'var(--green)' : 'var(--red)'}">${e.type === 'income' ? '+' : '−'}${money(e.amount)}</td>
           <td class="right"><button class="btn danger" data-del="${e.id}">✕</button></td>
         </tr>`).join('')}
       </tbody></table>` : '<p class="empty">No entries yet.</p>'}
     </div>`;
-
   $('#entry-form').onsubmit = async (ev) => {
     ev.preventDefault();
     const f = new FormData(ev.target);
     await api('/api/entries', { method: 'POST', body: {
       type: f.get('type'), category: f.get('category'), narrative: f.get('narrative'),
-      amount: parseFloat(f.get('amount')), date: f.get('date'),
-    }});
+      amount: parseFloat(f.get('amount')), date: f.get('date') } });
     render();
   };
   app.querySelectorAll('[data-del]').forEach((b) => b.onclick = async () => {
@@ -147,82 +141,86 @@ views.ledger = async () => {
   });
 };
 
-// ---------- Debts & Receivables ----------
+// ---------- Debts ----------
 views.debts = async () => {
   const debts = await api('/api/debts');
-  const open = debts.filter((d) => d.status === 'open');
-  const closed = debts.filter((d) => d.status === 'closed');
+  const groups = { paying: [], not_decided: [], not_possible: [], closed: [] };
+  debts.forEach((d) => groups[d.status].push(d));
 
   const row = (d) => `<tr>
-    <td>${esc(d.counterparty)}</td>
-    <td><span class="pill ${d.direction}">${d.direction}</span></td>
-    <td class="right">${money(d.principal)}</td>
-    <td class="right muted">${d.interest_rate ? d.interest_rate + '% · ' + money(d.interest) : '—'}</td>
-    <td class="right">${money(d.paid)}</td>
-    <td class="right"><b>${money(d.outstanding)}</b></td>
-    <td>${d.due_date ? fmtDate(d.due_date) : '—'}</td>
+    <td>${esc(d.source)} <span class="pill ${d.currency === 'AED' ? 'soon' : ''}" style="margin-left:4px;">${d.currency}</span></td>
+    <td class="right"><b>${money(d.remaining, d.currency)}</b></td>
+    <td class="right">${d.emi ? money(d.emi, d.currency) : (d.notes ? `<span class="muted">${esc(d.notes)}</span>` : '—')}</td>
+    <td class="right">${d.remaining_months || '—'}</td>
+    <td>${d.monthly_interest ? `<span style="color:var(--red)">${money(d.monthly_interest, d.currency)}/mo</span>` : '—'}</td>
     <td class="right">
-      <button class="btn small" data-pay="${d.id}">Pay</button>
-      <button class="btn ghost small" data-view-d="${d.id}">View</button>
+      ${d.status === 'paying' ? `<button class="btn small" data-pay="${d.id}">Pay</button>` : ''}
+      <button class="btn ghost small" data-edit="${d.id}">Edit</button>
       <button class="btn danger" data-del-d="${d.id}">✕</button>
     </td></tr>`;
 
+  const section = (key) => groups[key].length ? `<div class="panel">
+    <h3>${STATUS_LABEL[key]} (${groups[key].length})</h3>
+    <table><thead><tr><th>Source</th><th class="right">Remaining</th><th class="right">EMI / note</th><th class="right">Months</th><th>Interest</th><th></th></tr></thead>
+    <tbody>${groups[key].map(row).join('')}</tbody></table></div>` : '';
+
   app.innerHTML = `
-    <h2>Debts &amp; Receivables</h2>
-    <div class="panel">
-      <div class="panel-head"><h3>Add debt / receivable</h3></div>
-      <form class="grid" id="debt-form">
-        <label class="field">Direction
-          <select name="direction">
-            <option value="payable">I owe (payable)</option>
-            <option value="receivable">Owed to me (receivable)</option>
-          </select></label>
-        <label class="field">Counterparty
-          <input name="counterparty" placeholder="Person / entity" required /></label>
-        <label class="field">Principal
-          <input name="principal" type="number" step="0.01" min="0" required /></label>
-        <label class="field">Interest % (annual)
-          <input name="interest_rate" type="number" step="0.01" min="0" value="0" /></label>
-        <label class="field">Start date
-          <input name="start_date" type="date" value="${today()}" required /></label>
-        <label class="field">Due date
-          <input name="due_date" type="date" /></label>
-        <label class="field" style="grid-column: span 2;">Notes
-          <input name="notes" placeholder="optional" /></label>
-        <button class="btn" type="submit">Add</button>
-      </form>
-    </div>
+    <div class="panel-head"><h2 style="margin:0;">Debts</h2>
+      <div style="display:flex;gap:8px;">
+        <button class="btn ghost" id="import-btn">Import CSV</button>
+        <button class="btn" id="add-btn">+ Add debt</button>
+      </div></div>
+    ${debts.length ? '' : '<p class="empty">No debts yet. Add one or import your CSV.</p>'}
+    ${section('paying')}${section('not_decided')}${section('not_possible')}${section('closed')}`;
 
-    <div class="panel">
-      <h3>Open (${open.length})</h3>
-      ${open.length ? `<table><thead><tr><th>Who</th><th>Type</th><th class="right">Principal</th><th class="right">Interest</th><th class="right">Paid</th><th class="right">Outstanding</th><th>Due</th><th></th></tr></thead><tbody>${open.map(row).join('')}</tbody></table>` : '<p class="empty">No open items.</p>'}
-    </div>
-
-    ${closed.length ? `<div class="panel"><h3>Closed (${closed.length})</h3>
-      <table><thead><tr><th>Who</th><th>Type</th><th class="right">Principal</th><th class="right">Interest</th><th class="right">Paid</th><th class="right">Outstanding</th><th>Due</th><th></th></tr></thead><tbody>${closed.map(row).join('')}</tbody></table></div>` : ''}`;
-
-  $('#debt-form').onsubmit = async (ev) => {
-    ev.preventDefault();
-    const f = new FormData(ev.target);
-    await api('/api/debts', { method: 'POST', body: {
-      direction: f.get('direction'), counterparty: f.get('counterparty'),
-      principal: parseFloat(f.get('principal')), interest_rate: parseFloat(f.get('interest_rate')) || 0,
-      start_date: f.get('start_date'), due_date: f.get('due_date') || null, notes: f.get('notes'),
-    }});
-    render();
-  };
-  app.querySelectorAll('[data-del-d]').forEach((b) => b.onclick = async () => {
-    if (confirm('Delete this debt and all its payments?')) { await api('/api/debts/' + b.dataset.delD, { method: 'DELETE' }); render(); }
-  });
+  $('#add-btn').onclick = () => debtModal();
+  $('#import-btn').onclick = importModal;
   app.querySelectorAll('[data-pay]').forEach((b) => b.onclick = () => payModal(debts.find((d) => d.id == b.dataset.pay)));
-  app.querySelectorAll('[data-view-d]').forEach((b) => b.onclick = () => detailModal(debts.find((d) => d.id == b.dataset.viewD)));
+  app.querySelectorAll('[data-edit]').forEach((b) => b.onclick = () => debtModal(debts.find((d) => d.id == b.dataset.edit)));
+  app.querySelectorAll('[data-del-d]').forEach((b) => b.onclick = async () => {
+    if (confirm('Delete this debt?')) { await api('/api/debts/' + b.dataset.delD, { method: 'DELETE' }); render(); }
+  });
 };
 
+function debtModal(d) {
+  const v = d || { source: '', remaining: '', emi: '', remaining_months: '', currency: 'INR', monthly_interest: 0, status: 'paying', start_month: thisMonth(), notes: '' };
+  const opt = (val, label, sel) => `<option value="${val}" ${sel === val ? 'selected' : ''}>${label}</option>`;
+  openModal(d ? 'Edit debt' : 'Add debt', `
+    <form class="grid" id="debt-form">
+      <label class="field" style="grid-column: span 2;">Source<input name="source" value="${esc(v.source)}" required /></label>
+      <label class="field">Currency<select name="currency">${opt('INR', '₹ INR', v.currency)}${opt('AED', 'AED', v.currency)}</select></label>
+      <label class="field">Status<select name="status">
+        ${opt('paying', 'Paying', v.status)}${opt('not_decided', 'Not decided', v.status)}${opt('not_possible', 'Not possible', v.status)}${opt('closed', 'Closed', v.status)}</select></label>
+      <label class="field">Remaining<input name="remaining" type="number" step="0.01" value="${v.remaining}" required /></label>
+      <label class="field">EMI / month<input name="emi" type="number" step="0.01" value="${v.emi}" /></label>
+      <label class="field">Remaining months<input name="remaining_months" type="number" value="${v.remaining_months}" /></label>
+      <label class="field">Start month<input name="start_month" type="month" value="${v.start_month || thisMonth()}" /></label>
+      <label class="field">Interest /mo (optional)<input name="monthly_interest" type="number" step="0.01" value="${v.monthly_interest}" /></label>
+      <label class="field" style="grid-column: span 2;">Notes<input name="notes" value="${esc(v.notes)}" /></label>
+      <button class="btn" type="submit">${d ? 'Save' : 'Add'}</button>
+    </form>`, (close) => {
+    $('#debt-form').onsubmit = async (ev) => {
+      ev.preventDefault();
+      const f = new FormData(ev.target);
+      const body = {
+        source: f.get('source'), currency: f.get('currency'), status: f.get('status'),
+        remaining: parseFloat(f.get('remaining')) || 0, emi: parseFloat(f.get('emi')) || 0,
+        remaining_months: parseInt(f.get('remaining_months')) || 0,
+        start_month: f.get('start_month'), monthly_interest: parseFloat(f.get('monthly_interest')) || 0,
+        notes: f.get('notes'),
+      };
+      if (d) await api('/api/debts/' + d.id, { method: 'PATCH', body });
+      else await api('/api/debts', { method: 'POST', body });
+      close(); render();
+    };
+  });
+}
+
 function payModal(d) {
-  openModal(`Record payment — ${d.counterparty}`, `
-    <p class="muted" style="margin-bottom:14px;">Outstanding: <b>${money(d.outstanding)}</b></p>
+  openModal(`Record payment — ${d.source}`, `
+    <p class="muted" style="margin-bottom:14px;">Remaining: <b>${money(d.remaining, d.currency)}</b>${d.emi ? ' · EMI ' + money(d.emi, d.currency) : ''}</p>
     <form class="grid" id="pay-form">
-      <label class="field">Amount<input name="amount" type="number" step="0.01" min="0" value="${d.outstanding.toFixed(2)}" required /></label>
+      <label class="field">Amount<input name="amount" type="number" step="0.01" min="0" value="${(d.emi || d.remaining).toFixed ? (d.emi || d.remaining).toFixed(0) : (d.emi || d.remaining)}" required /></label>
       <label class="field">Date<input name="date" type="date" value="${today()}" required /></label>
       <label class="field" style="grid-column: span 2;">Note<input name="note" placeholder="optional" /></label>
       <button class="btn" type="submit">Save payment</button>
@@ -231,30 +229,29 @@ function payModal(d) {
       ev.preventDefault();
       const f = new FormData(ev.target);
       await api(`/api/debts/${d.id}/payments`, { method: 'POST', body: {
-        amount: parseFloat(f.get('amount')), date: f.get('date'), note: f.get('note'),
-      }});
+        amount: parseFloat(f.get('amount')), date: f.get('date'), note: f.get('note') } });
       close(); render();
     };
   });
 }
 
-async function detailModal(d) {
-  const pays = await api(`/api/debts/${d.id}/payments`);
-  openModal(`${d.counterparty} — ${d.direction}`, `
-    <div class="cards" style="grid-template-columns:repeat(2,1fr);">
-      <div class="card"><div class="label">Principal</div><div class="value">${money(d.principal)}</div></div>
-      <div class="card"><div class="label">Outstanding</div><div class="value ${d.outstanding > 0 ? 'amber' : 'green'}">${money(d.outstanding)}</div></div>
-    </div>
-    <p class="muted" style="margin:10px 0;">Started ${fmtDate(d.start_date)} · Due ${fmtDate(d.due_date)} · Interest ${d.interest_rate}% (${money(d.interest)} accrued)</p>
-    ${d.notes ? `<p style="margin-bottom:14px;">${esc(d.notes)}</p>` : ''}
-    <h3>Payments</h3>
-    ${pays.length ? `<table><thead><tr><th>Date</th><th>Note</th><th class="right">Amount</th><th></th></tr></thead><tbody>
-      ${pays.map((p) => `<tr><td>${fmtDate(p.date)}</td><td class="muted">${esc(p.note)}</td><td class="right">${money(p.amount)}</td>
-      <td class="right"><button class="btn danger" data-delp="${p.id}">✕</button></td></tr>`).join('')}
-    </tbody></table>` : '<p class="empty">No payments yet.</p>'}`, (close) => {
-    modalHost.querySelectorAll('[data-delp]').forEach((b) => b.onclick = async () => {
-      await api('/api/payments/' + b.dataset.delp, { method: 'DELETE' }); close(); render();
-    });
+function importModal() {
+  openModal('Import debts from CSV', `
+    <p class="muted" style="margin-bottom:12px;">Paste your "Budgeting - Debt" CSV (with Source, Remaining, EMI, Remaining Month columns). AED detected from the source name; "Not paid/decided/asking" and "Not possible" become statuses automatically.</p>
+    <textarea id="csv-text" rows="8" style="width:100%;" placeholder="Source,Remaining,Equated Monthly Installment,Remaining Month,..."></textarea>
+    <label style="display:flex;gap:8px;align-items:center;margin:12px 0;font-size:.88rem;">
+      <input type="checkbox" id="csv-replace" /> Replace all existing debts</label>
+    <button class="btn" id="csv-go">Import</button>
+    <span id="csv-msg" class="muted" style="margin-left:10px;"></span>`, (close) => {
+    $('#csv-go').onclick = async () => {
+      const csv = $('#csv-text').value.trim();
+      if (!csv) { $('#csv-msg').textContent = 'Paste CSV first.'; return; }
+      try {
+        const r = await api('/api/debts/import', { method: 'POST', body: { csv, replace: $('#csv-replace').checked } });
+        $('#csv-msg').textContent = `Imported ${r.imported} rows.`;
+        setTimeout(() => { close(); render(); }, 700);
+      } catch (e) { $('#csv-msg').textContent = 'Error: ' + e.message; }
+    };
   });
 }
 
@@ -262,45 +259,79 @@ async function detailModal(d) {
 let calRef = new Date();
 views.calendar = async () => {
   const debts = await api('/api/debts');
-  const events = {};
-  debts.filter((d) => d.due_date && d.status === 'open').forEach((d) => {
-    (events[d.due_date] = events[d.due_date] || []).push(d);
-  });
+  const events = {}; // YYYY-MM -> [{source, amount, currency}]
+  debts.forEach((d) => d.schedule.forEach((s) => {
+    (events[s.month] = events[s.month] || []).push({ source: d.source, amount: s.amount, currency: d.currency });
+  }));
 
   const y = calRef.getFullYear(), m = calRef.getMonth();
-  const first = new Date(y, m, 1);
-  const startDow = first.getDay();
-  const days = new Date(y, m + 1, 0).getDate();
+  const ym = `${y}-${String(m + 1).padStart(2, '0')}`;
   const monthName = calRef.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
-  const dow = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-
-  let cells = dow.map((d) => `<div class="cal-cell dow">${d}</div>`).join('');
-  for (let i = 0; i < startDow; i++) cells += '<div class="cal-cell empty-cell"></div>';
-  for (let day = 1; day <= days; day++) {
-    const ds = `${y}-${String(m + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-    const evs = events[ds] || [];
-    cells += `<div class="cal-cell ${ds === today() ? 'today' : ''}">
-      <div class="daynum">${day}</div>
-      ${evs.map((e) => `<div class="cal-event ${e.direction}" title="${esc(e.counterparty)}: ${money(e.outstanding)}">${esc(e.counterparty)} ${money(e.outstanding)}</div>`).join('')}
-    </div>`;
-  }
+  const evs = events[ym] || [];
+  const tot = evs.reduce((a, e) => { a[e.currency] = (a[e.currency] || 0) + e.amount; return a; }, {});
 
   app.innerHTML = `
-    <h2>Debt Calendar</h2>
+    <h2>Payment Calendar</h2>
     <div class="panel">
       <div class="panel-head">
         <button class="btn ghost small" id="prev">← Prev</button>
         <h3 style="margin:0;">${monthName}</h3>
         <button class="btn ghost small" id="next">Next →</button>
       </div>
-      <div class="cal-grid">${cells}</div>
-      <div class="legend" style="margin-top:14px;">
-        <span><span class="dot exp"></span>Payable due</span>
-        <span><span class="dot inc"></span>Receivable due</span>
-      </div>
+      ${evs.length ? `<table><thead><tr><th>Source</th><th class="right">EMI due</th></tr></thead><tbody>
+        ${evs.map((e) => `<tr><td>${esc(e.source)}</td><td class="right">${money(e.amount, e.currency)}</td></tr>`).join('')}
+        <tr><td><b>Total</b></td><td class="right"><b>${Object.entries(tot).map(([c, v]) => money(v, c)).join(' + ')}</b></td></tr>
+      </tbody></table>` : '<p class="empty">No EMIs scheduled this month.</p>'}
     </div>`;
   $('#prev').onclick = () => { calRef = new Date(y, m - 1, 1); render(); };
   $('#next').onclick = () => { calRef = new Date(y, m + 1, 1); render(); };
 };
 
+// ---------- Chat (Claude Max via local CLI) ----------
+const chatLog = [];
+function toggleChat(open) {
+  const panel = $('#chat-panel');
+  panel.classList.toggle('open', open ?? !panel.classList.contains('open'));
+}
+function renderChat() {
+  $('#chat-messages').innerHTML = chatLog.map((m) =>
+    `<div class="chat-msg ${m.role}">${m.role === 'assistant' ? m.text : esc(m.text)}</div>`).join('');
+  const box = $('#chat-messages'); box.scrollTop = box.scrollHeight;
+}
+async function sendChat() {
+  const input = $('#chat-input');
+  const msg = input.value.trim();
+  if (!msg) return;
+  chatLog.push({ role: 'user', text: msg });
+  chatLog.push({ role: 'assistant', text: '<span class="muted">Thinking… (Claude Max)</span>' });
+  input.value = ''; renderChat();
+  try {
+    const r = await api('/api/chat', { method: 'POST', body: { message: msg } });
+    chatLog[chatLog.length - 1] = { role: 'assistant', text: esc(r.reply).replace(/\n/g, '<br>') };
+  } catch (e) {
+    chatLog[chatLog.length - 1] = { role: 'assistant', text: '<span style="color:var(--red)">Error: ' + esc(e.message) + '</span>' };
+  }
+  renderChat();
+}
+function mountChat() {
+  document.body.insertAdjacentHTML('beforeend', `
+    <button id="chat-fab" title="Ask Claude about your finances">💬 Ask Claude</button>
+    <div id="chat-panel">
+      <div class="chat-head"><b>Finance Assistant</b><span class="muted" style="font-size:.75rem;"> · Claude Max</span>
+        <button class="btn ghost small" id="chat-close" style="margin-left:auto;">✕</button></div>
+      <div id="chat-messages"><div class="chat-msg assistant">Hi! Ask me anything about your income, expenses, or debts — e.g. "How much EMI do I owe next month?" or "Which debt should I clear first?"</div></div>
+      <div class="chat-input-row">
+        <textarea id="chat-input" rows="1" placeholder="Ask about your finances…"></textarea>
+        <button class="btn" id="chat-send">Send</button>
+      </div>
+    </div>`);
+  $('#chat-fab').onclick = () => toggleChat();
+  $('#chat-close').onclick = () => toggleChat(false);
+  $('#chat-send').onclick = sendChat;
+  $('#chat-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+  });
+}
+
+mountChat();
 render();

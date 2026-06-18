@@ -19,21 +19,24 @@ db.exec(`
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
-  -- Debts: payable (I owe) and receivable (owed to me)
+  -- Debts: EMI-based and informal. 'remaining' is the live outstanding balance.
   CREATE TABLE IF NOT EXISTS debts (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    direction     TEXT NOT NULL CHECK (direction IN ('payable','receivable')),
-    counterparty  TEXT NOT NULL,
-    principal     REAL NOT NULL,
-    interest_rate REAL NOT NULL DEFAULT 0,   -- annual %, simple interest
-    start_date    TEXT NOT NULL,
-    due_date      TEXT,
-    status        TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
-    notes         TEXT NOT NULL DEFAULT '',
-    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    source           TEXT NOT NULL,                 -- lender / counterparty
+    direction        TEXT NOT NULL DEFAULT 'payable' CHECK (direction IN ('payable','receivable')),
+    remaining        REAL NOT NULL,                 -- current outstanding
+    emi              REAL DEFAULT 0,                -- equated monthly installment
+    remaining_months INTEGER DEFAULT 0,            -- months left in the plan
+    currency         TEXT NOT NULL DEFAULT 'INR',   -- INR | AED
+    monthly_interest REAL NOT NULL DEFAULT 0,       -- interest bleeding per month (e.g. Nizam)
+    status           TEXT NOT NULL DEFAULT 'paying'
+                     CHECK (status IN ('paying','not_decided','not_possible','closed')),
+    start_month      TEXT,                          -- YYYY-MM the schedule starts
+    notes            TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
-  -- Payments made against a debt (reduces / settles it)
+  -- Payments made against a debt (reduces 'remaining')
   CREATE TABLE IF NOT EXISTS payments (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     debt_id   INTEGER NOT NULL REFERENCES debts(id) ON DELETE CASCADE,
