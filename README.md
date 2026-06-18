@@ -1,5 +1,9 @@
 # My Finance
 
+> **Taking over this project (new dev / Claude session) or hosting it? Read [HANDOFF.md](HANDOFF.md) first.**
+> It covers the architecture, the two-currency domain logic, the Supabase migration plan, and the
+> chat-CLI hosting caveat.
+
 A personal finance web app: track **income & expenses**, manage **debts & receivables**,
 record **payments**, watch a **debt calendar**, and get **reminders** for what's due.
 
