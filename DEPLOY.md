@@ -51,6 +51,27 @@ fixes (Hitesh EMI=1000; Nizam `interest_days=20,30`).
 - Sign in with `ALLOWED_EMAIL`, confirm your debts/entries load (data migrated).
 - Open chat → ask a question → confirm a reply (Anthropic API).
 
+## Chat via a subscription (no API key) — "log in once, stays logged in"
+This is the OAuth-based, sanctioned version of a "browser login that persists" — the
+`claude` CLI stores a refresh token at first login and renews it forever. Do NOT try to
+automate/scrape claude.ai in a browser/Electron — it violates Anthropic's terms, is brittle,
+and risks the account.
+
+```bash
+# 1. ON YOUR LAPTOP — one-time browser login into a dedicated config dir
+CLAUDE_CONFIG_DIR="$HOME/.claude-finance" claude        # then /login with the chosen account
+
+# 2. Carry that dir (it holds the refresh token) to the host
+scp -r "$HOME/.claude-finance" user@host:~/.claude-finance
+
+# 3. ON THE HOST — set in the app env (.env):
+#    CLAUDE_CONFIG_DIR=/home/user/.claude-finance
+#    CLAUDE_BIN=/abs/path/to/claude   (if not on PATH)
+```
+Leave `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` empty so chat uses this CLI. The app
+spawns `claude -p` with that config dir; the CLI auto-refreshes the token, so it stays logged
+in with no re-auth.
+
 ## Notes
 - **Cost**: chat bills per use. Default model `claude-opus-4-8` (~$5/$25 per Mtok);
   set `CHAT_MODEL=claude-sonnet-4-6` or `claude-haiku-4-5` to cut cost.
