@@ -5,9 +5,9 @@ const modalHost = $('#modal-host');
 
 const api = async (url, opts) => {
   const headers = { 'Content-Type': 'application/json' };
-  if (window._sb) {
-    const { data: { session } } = await window._sb.auth.getSession();
-    if (session) headers.Authorization = 'Bearer ' + session.access_token;
+  if (window._auth) {
+    const t = await window._auth.getToken();
+    if (t) headers.Authorization = 'Bearer ' + t;
   }
   const r = await fetch(url, {
     headers,
@@ -469,18 +469,59 @@ function mountChat() {
 }
 
 // ---------- auth bootstrap ----------
-function showLogin(sb, msg) {
+const loginShell = (inner) => {
   document.querySelector('.tabs').style.display = 'none';
-  app.innerHTML = `
-    <div class="panel" style="max-width:420px;margin:60px auto;">
-      <h2 style="margin-bottom:8px;">Sign in</h2>
-      <p class="muted" style="margin-bottom:16px;">Enter your email — we'll send a magic sign-in link.</p>
-      <form id="login-form" class="grid" style="grid-template-columns:1fr;">
-        <label class="field">Email<input name="email" type="email" required placeholder="you@example.com" /></label>
-        <button class="btn" type="submit">Send magic link</button>
-      </form>
-      <p class="muted" id="login-msg" style="margin-top:12px;">${msg || ''}</p>
-    </div>`;
+  app.innerHTML = `<div class="panel" style="max-width:420px;margin:60px auto;">${inner}</div>`;
+};
+
+// Appwrite email one-time-code login (two steps: email → code)
+function showAppwriteLogin(account, ID, msg) {
+  loginShell(`
+    <h2 style="margin-bottom:8px;">Sign in</h2>
+    <p class="muted" style="margin-bottom:16px;">Enter your email — we'll send a 6-digit code.</p>
+    <form id="email-form" class="grid" style="grid-template-columns:1fr;">
+      <label class="field">Email<input name="email" type="email" required placeholder="you@example.com" /></label>
+      <button class="btn" type="submit">Send code</button>
+    </form>
+    <p class="muted" id="login-msg" style="margin-top:12px;">${msg || ''}</p>`);
+  $('#email-form').onsubmit = async (ev) => {
+    ev.preventDefault();
+    const email = new FormData(ev.target).get('email');
+    $('#login-msg').textContent = 'Sending…';
+    try {
+      const tok = await account.createEmailToken(ID.unique(), email);
+      showAppwriteCode(account, tok.userId, email);
+    } catch (e) { $('#login-msg').textContent = 'Error: ' + e.message; }
+  };
+}
+function showAppwriteCode(account, userId, email) {
+  loginShell(`
+    <h2 style="margin-bottom:8px;">Enter code</h2>
+    <p class="muted" style="margin-bottom:16px;">We sent a 6-digit code to ${esc(email)}.</p>
+    <form id="code-form" class="grid" style="grid-template-columns:1fr;">
+      <label class="field">Code<input name="code" inputmode="numeric" required placeholder="123456" /></label>
+      <button class="btn" type="submit">Verify &amp; sign in</button>
+    </form>
+    <p class="muted" id="login-msg" style="margin-top:12px;"></p>`);
+  $('#code-form').onsubmit = async (ev) => {
+    ev.preventDefault();
+    const code = new FormData(ev.target).get('code').trim();
+    $('#login-msg').textContent = 'Verifying…';
+    try { await account.createSession(userId, code); location.reload(); }
+    catch (e) { $('#login-msg').textContent = 'Invalid code: ' + e.message; }
+  };
+}
+
+// Supabase magic-link login (fallback path)
+function showSupabaseLogin(sb, msg) {
+  loginShell(`
+    <h2 style="margin-bottom:8px;">Sign in</h2>
+    <p class="muted" style="margin-bottom:16px;">Enter your email — we'll send a magic sign-in link.</p>
+    <form id="login-form" class="grid" style="grid-template-columns:1fr;">
+      <label class="field">Email<input name="email" type="email" required placeholder="you@example.com" /></label>
+      <button class="btn" type="submit">Send magic link</button>
+    </form>
+    <p class="muted" id="login-msg" style="margin-top:12px;">${msg || ''}</p>`);
   $('#login-form').onsubmit = async (ev) => {
     ev.preventDefault();
     const email = new FormData(ev.target).get('email');
@@ -493,13 +534,23 @@ function showLogin(sb, msg) {
 async function boot() {
   let cfg;
   try { cfg = await fetch('/api/config').then((r) => r.json()); }
-  catch { cfg = { authEnabled: false }; }
-  if (cfg.authEnabled) {
+  catch { cfg = { auth: 'none' }; }
+
+  if (cfg.auth === 'appwrite') {
+    const { Client, Account, ID } = window.Appwrite;
+    const account = new Account(new Client().setEndpoint(cfg.appwrite.endpoint).setProject(cfg.appwrite.project));
+    let jwt = null, jwtExp = 0;
+    window._auth = { getToken: async () => {
+      if (jwt && Date.now() < jwtExp) return jwt;
+      try { const r = await account.createJWT(); jwt = r.jwt; jwtExp = Date.now() + 13 * 60 * 1000; return jwt; }
+      catch { return null; }
+    } };
+    try { await account.get(); } catch { showAppwriteLogin(account, ID); return; }
+  } else if (cfg.auth === 'supabase') {
     const sb = window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseAnonKey);
-    window._sb = sb;
-    sb.auth.onAuthStateChange(() => {}); // keep session fresh
+    window._auth = { getToken: async () => { const { data: { session } } = await sb.auth.getSession(); return session?.access_token || null; } };
     const { data: { session } } = await sb.auth.getSession();
-    if (!session) { showLogin(sb); return; }
+    if (!session) { showSupabaseLogin(sb); return; }
   }
   mountChat();
   render();

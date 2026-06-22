@@ -5,7 +5,8 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
-import { q, one, init } from './db.js';
+import { data, BACKEND, initData } from './data.js';
+import { APPWRITE, verifyJwt } from './appwrite.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -16,34 +17,40 @@ const wrap = (fn) => async (req, res) => {
   catch (e) { res.status(400).json({ error: e.message }); }
 };
 
-// ---- auth (Supabase) — enabled only when SUPABASE_URL is set ---------------
-const AUTH = !!process.env.SUPABASE_URL;
-const supa = AUTH ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY) : null;
+// ---- auth: Appwrite (JWT) → Supabase → none -------------------------------
+const SUPA_URL = process.env.SUPABASE_URL;
+const supa = (!APPWRITE && SUPA_URL) ? createClient(SUPA_URL, process.env.SUPABASE_ANON_KEY) : null;
+const AUTH = APPWRITE ? 'appwrite' : (supa ? 'supabase' : 'none');
 const ALLOWED = (process.env.ALLOWED_EMAIL || '').toLowerCase();
 
 async function requireAuth(req, res, next) {
-  if (!AUTH) return next();                       // local dev: no auth
+  if (AUTH === 'none') return next();
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : '';
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
-  const { data, error } = await supa.auth.getUser(token);
-  if (error || !data?.user) return res.status(401).json({ error: 'Invalid session' });
-  if (ALLOWED && (data.user.email || '').toLowerCase() !== ALLOWED)
-    return res.status(403).json({ error: 'Not authorized for this app' });
-  req.user = data.user;
-  next();
+  try {
+    let email;
+    if (AUTH === 'appwrite') { email = (await verifyJwt(token)).email; }
+    else { const { data: d, error } = await supa.auth.getUser(token); if (error || !d?.user) throw new Error('bad'); email = d.user.email; }
+    if (ALLOWED && (email || '').toLowerCase() !== ALLOWED) return res.status(403).json({ error: 'Not authorized for this app' });
+    req.userEmail = email;
+    next();
+  } catch { return res.status(401).json({ error: 'Invalid session' }); }
 }
-// Gate every /api route except the public config/health endpoints.
 app.use('/api', (req, res, next) =>
   (req.path === '/config' || req.path === '/health') ? next() : requireAuth(req, res, next));
 
-app.get('/api/config', (req, res) =>
-  res.json({ authEnabled: AUTH, supabaseUrl: process.env.SUPABASE_URL || null, supabaseAnonKey: process.env.SUPABASE_ANON_KEY || null }));
+app.get('/api/config', (req, res) => res.json({
+  auth: AUTH,
+  appwrite: APPWRITE ? { endpoint: process.env.APPWRITE_ENDPOINT, project: process.env.APPWRITE_PROJECT } : null,
+  supabaseUrl: !APPWRITE ? (SUPA_URL || null) : null,
+  supabaseAnonKey: !APPWRITE ? (process.env.SUPABASE_ANON_KEY || null) : null,
+}));
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.use(express.static(join(__dirname, 'public')));
 
-// ---- month helpers ---------------------------------------------------------
+// ---- helpers ---------------------------------------------------------------
 const thisMonth = () => new Date().toISOString().slice(0, 7);
 function addMonths(ym, n) {
   const [y, m] = ym.split('-').map(Number);
@@ -89,7 +96,6 @@ function commitmentsForMonth(ym, debts, recurrings) {
   return items;
 }
 
-// ---- currency conversion for ledger entries --------------------------------
 function recvAmount(e) {
   const from = e.currency, to = e.recv_currency || e.currency;
   if (from === to) return e.amount;
@@ -105,10 +111,13 @@ function inrValue(e) {
   return e.rate ? e.amount * e.rate : 0;
 }
 const entryView = (e) => ({ ...e, recv_amount: recvAmount(e), inr_value: inrValue(e) });
+const byDateDesc = (a, b) => (b.date || '').localeCompare(a.date || '') || String(b.created_at || '').localeCompare(String(a.created_at || ''));
+const sameId = (a, b) => String(a) === String(b);
+const num = (s) => Number(String(s ?? '').replace(/[^0-9.\-]/g, '')) || 0;
 
 // ---- entries ---------------------------------------------------------------
 app.get('/api/entries', wrap(async (req, res) => {
-  const rows = await q('SELECT * FROM entries ORDER BY date DESC, id DESC');
+  const rows = (await data.list('entries')).sort(byDateDesc);
   res.json(rows.map(entryView));
 }));
 
@@ -120,60 +129,55 @@ app.post('/api/entries', wrap(async (req, res) => {
   let cur = currency || 'INR', recv = recv_currency || cur, rt = Number(rate) || 0;
   if (kind === 'transfer') { cur = 'AED'; recv = 'INR'; if (!(rt > 0)) throw new Error('Transfer needs an exchange rate (₹/AED)'); }
   else if (cur !== recv && !(rt > 0)) throw new Error('A rate (₹/AED) is required when "Amount in" and "Received in" differ');
-  const row = await one(
-    `INSERT INTO entries (kind,currency,recv_currency,category,narrative,amount,rate,date)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-    [kind, cur, recv, category || 'General', narrative || '', amount, rt, date]);
+  const row = await data.create('entries', {
+    kind, currency: cur, recv_currency: recv, category: category || 'General',
+    narrative: narrative || '', amount: Number(amount), rate: rt, date,
+  });
   res.json(entryView(row));
 }));
 
-app.delete('/api/entries/:id', wrap(async (req, res) => {
-  await q('DELETE FROM entries WHERE id = $1', [req.params.id]);
-  res.json({ ok: true });
-}));
+app.delete('/api/entries/:id', wrap(async (req, res) => { await data.remove('entries', req.params.id); res.json({ ok: true }); }));
 
 // ---- debts -----------------------------------------------------------------
+const STATUS_ORDER = { paying: 0, not_decided: 1, not_possible: 2, closed: 3 };
 app.get('/api/debts', wrap(async (req, res) => {
-  const order = "CASE status WHEN 'paying' THEN 0 WHEN 'not_decided' THEN 1 WHEN 'not_possible' THEN 2 ELSE 3 END";
-  const rows = await q(`SELECT * FROM debts ORDER BY ${order}, remaining DESC`);
+  const rows = (await data.list('debts')).sort((a, b) =>
+    (STATUS_ORDER[a.status] - STATUS_ORDER[b.status]) || (b.remaining - a.remaining));
   res.json(rows.map(debtView));
 }));
-
-const num = (s) => Number(String(s ?? '').replace(/[^0-9.\-]/g, '')) || 0;
 
 async function insertDebt(b) {
   if (!b.source) throw new Error('Source required');
   if (b.remaining == null) throw new Error('Remaining required');
-  return one(
-    `INSERT INTO debts (source,direction,remaining,emi,remaining_months,currency,monthly_interest,interest_days,status,start_month,notes)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-    [b.source, b.direction || 'payable', Number(b.remaining) || 0, Number(b.emi) || 0,
-     Number(b.remaining_months) || 0, b.currency || 'INR', Number(b.monthly_interest) || 0,
-     b.interest_days || '', b.status || 'paying', b.start_month || thisMonth(), b.notes || '']);
+  return data.create('debts', {
+    source: b.source, direction: b.direction || 'payable', remaining: Number(b.remaining) || 0,
+    emi: Number(b.emi) || 0, remaining_months: Number(b.remaining_months) || 0, currency: b.currency || 'INR',
+    monthly_interest: Number(b.monthly_interest) || 0, interest_days: b.interest_days || '',
+    status: b.status || 'paying', start_month: b.start_month || thisMonth(), notes: b.notes || '',
+  });
 }
 
-app.post('/api/debts', wrap(async (req, res) => {
-  res.json(debtView(await insertDebt(req.body)));
-}));
+app.post('/api/debts', wrap(async (req, res) => { res.json(debtView(await insertDebt(req.body))); }));
 
 const DEBT_FIELDS = ['source', 'direction', 'remaining', 'emi', 'remaining_months',
   'currency', 'monthly_interest', 'interest_days', 'status', 'start_month', 'notes'];
-
 app.patch('/api/debts/:id', wrap(async (req, res) => {
-  const debt = await one('SELECT * FROM debts WHERE id = $1', [req.params.id]);
+  const debt = await data.get('debts', req.params.id);
   if (!debt) throw new Error('Not found');
-  const cols = [], vals = [];
-  for (const f of DEBT_FIELDS) if (f in req.body) { cols.push(f); vals.push(req.body[f]); }
-  if (cols.length) {
-    const set = cols.map((c, i) => `${c} = $${i + 1}`).join(', ');
-    vals.push(debt.id);
-    await q(`UPDATE debts SET ${set} WHERE id = $${vals.length}`, vals);
-  }
-  res.json(debtView(await one('SELECT * FROM debts WHERE id = $1', [debt.id])));
+  const upd = {};
+  for (const f of DEBT_FIELDS) if (f in req.body) upd[f] = req.body[f];
+  const row = Object.keys(upd).length ? await data.update('debts', debt.id, upd) : debt;
+  res.json(debtView(row));
 }));
 
 app.delete('/api/debts/:id', wrap(async (req, res) => {
-  await q('DELETE FROM debts WHERE id = $1', [req.params.id]);
+  // remove dependent payment/interest rows first (no FK cascade on Appwrite)
+  const id = req.params.id;
+  for (const t of ['payments', 'interest_payments']) {
+    const dep = (await data.list(t)).filter((r) => sameId(r.debt_id, id));
+    for (const r of dep) await data.remove(t, r.id);
+  }
+  await data.remove('debts', id);
   res.json({ ok: true });
 }));
 
@@ -199,7 +203,7 @@ app.post('/api/debts/import', wrap(async (req, res) => {
   const rows = parseCsv(text);
   if (rows.length < 2) throw new Error('CSV has no data rows');
   const startMonth = req.body.start_month || thisMonth();
-  if (req.body.replace) await q('DELETE FROM debts');
+  if (req.body.replace) { for (const d of await data.list('debts')) await data.remove('debts', d.id); }
 
   let imported = 0;
   for (let i = 1; i < rows.length; i++) {
@@ -226,51 +230,48 @@ app.post('/api/debts/import', wrap(async (req, res) => {
 
 // ---- payments --------------------------------------------------------------
 app.get('/api/debts/:id/payments', wrap(async (req, res) => {
-  res.json(await q('SELECT * FROM payments WHERE debt_id = $1 ORDER BY date DESC, id DESC', [req.params.id]));
+  const rows = (await data.list('payments')).filter((p) => sameId(p.debt_id, req.params.id)).sort(byDateDesc);
+  res.json(rows);
 }));
 
 app.post('/api/debts/:id/payments', wrap(async (req, res) => {
-  const debt = await one('SELECT * FROM debts WHERE id = $1', [req.params.id]);
+  const debt = await data.get('debts', req.params.id);
   if (!debt) throw new Error('Debt not found');
   const { amount, date, note } = req.body;
   if (!(amount > 0)) throw new Error('Amount must be positive');
   if (!date) throw new Error('Date required');
-  await q('INSERT INTO payments (debt_id,amount,date,note) VALUES ($1,$2,$3,$4)', [debt.id, amount, date, note || '']);
+  await data.create('payments', { debt_id: String(debt.id), amount: Number(amount), date, note: note || '' });
   const newRemaining = Math.max(0, debt.remaining - amount);
   const newMonths = Math.max(0, (debt.remaining_months || 0) - 1);
   const newStatus = newRemaining <= 0.5 ? 'closed' : debt.status;
-  await q('UPDATE debts SET remaining=$1, remaining_months=$2, status=$3 WHERE id=$4', [newRemaining, newMonths, newStatus, debt.id]);
-  res.json(debtView(await one('SELECT * FROM debts WHERE id = $1', [debt.id])));
+  const row = await data.update('debts', debt.id, { remaining: newRemaining, remaining_months: newMonths, status: newStatus });
+  res.json(debtView(row));
 }));
 
-app.delete('/api/payments/:id', wrap(async (req, res) => {
-  await q('DELETE FROM payments WHERE id = $1', [req.params.id]);
-  res.json({ ok: true });
-}));
+app.delete('/api/payments/:id', wrap(async (req, res) => { await data.remove('payments', req.params.id); res.json({ ok: true }); }));
 
 // ---- interest payments -----------------------------------------------------
 app.get('/api/debts/:id/interest', wrap(async (req, res) => {
-  res.json(await q('SELECT * FROM interest_payments WHERE debt_id = $1 ORDER BY date DESC, id DESC', [req.params.id]));
+  const rows = (await data.list('interest_payments')).filter((p) => sameId(p.debt_id, req.params.id)).sort(byDateDesc);
+  res.json(rows);
 }));
 
 app.post('/api/debts/:id/interest', wrap(async (req, res) => {
-  const debt = await one('SELECT * FROM debts WHERE id = $1', [req.params.id]);
+  const debt = await data.get('debts', req.params.id);
   if (!debt) throw new Error('Debt not found');
   const { amount, date, note } = req.body;
   if (!(amount > 0)) throw new Error('Amount must be positive');
   if (!date) throw new Error('Date required');
-  await q('INSERT INTO interest_payments (debt_id,amount,date,note) VALUES ($1,$2,$3,$4)', [debt.id, amount, date, note || '']);
+  await data.create('interest_payments', { debt_id: String(debt.id), amount: Number(amount), date, note: note || '' });
   res.json({ ok: true });
 }));
 
-app.delete('/api/interest/:id', wrap(async (req, res) => {
-  await q('DELETE FROM interest_payments WHERE id = $1', [req.params.id]);
-  res.json({ ok: true });
-}));
+app.delete('/api/interest/:id', wrap(async (req, res) => { await data.remove('interest_payments', req.params.id); res.json({ ok: true }); }));
 
 // ---- recurring -------------------------------------------------------------
 app.get('/api/recurring', wrap(async (req, res) => {
-  res.json(await q('SELECT * FROM recurring ORDER BY start_month, label'));
+  const rows = (await data.list('recurring')).sort((a, b) => (a.start_month || '').localeCompare(b.start_month || '') || (a.label || '').localeCompare(b.label || ''));
+  res.json(rows);
 }));
 
 app.post('/api/recurring', wrap(async (req, res) => {
@@ -278,26 +279,21 @@ app.post('/api/recurring', wrap(async (req, res) => {
   if (!label) throw new Error('Label required');
   if (!(amount > 0)) throw new Error('Amount must be positive');
   if (!start_month) throw new Error('Start month required');
-  const row = await one(
-    'INSERT INTO recurring (label,amount,currency,category,start_month,end_month) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-    [label, amount, currency || 'INR', category || 'General', start_month, end_month || null]);
+  const row = await data.create('recurring', { label, amount: Number(amount), currency: currency || 'INR', category: category || 'General', start_month, end_month: end_month || null });
   res.json(row);
 }));
 
-app.delete('/api/recurring/:id', wrap(async (req, res) => {
-  await q('DELETE FROM recurring WHERE id = $1', [req.params.id]);
-  res.json({ ok: true });
-}));
+app.delete('/api/recurring/:id', wrap(async (req, res) => { await data.remove('recurring', req.params.id); res.json({ ok: true }); }));
 
 app.get('/api/commitments/:month', wrap(async (req, res) => {
-  const debts = (await q('SELECT * FROM debts')).map(debtView);
-  const recur = await q('SELECT * FROM recurring');
+  const debts = (await data.list('debts')).map(debtView);
+  const recur = await data.list('recurring');
   res.json(commitmentsForMonth(req.params.month, debts, recur));
 }));
 
 // ---- summary ---------------------------------------------------------------
 app.get('/api/summary', wrap(async (req, res) => {
-  const all = await q('SELECT * FROM entries');
+  const all = await data.list('entries');
   const bal = { INR: 0, AED: 0 };
   let incomeINR = 0, expenseINR = 0;
   for (const e of all) {
@@ -306,11 +302,11 @@ app.get('/api/summary', wrap(async (req, res) => {
     else if (e.kind === 'expense') { bal[to] = (bal[to] || 0) - recvAmount(e); expenseINR += inrValue(e); }
     else if (e.kind === 'transfer') { bal.AED -= e.amount; bal.INR += e.amount * e.rate; }
   }
-  const debts = (await q('SELECT * FROM debts')).map(debtView);
-  const curById = Object.fromEntries(debts.map((d) => [d.id, d.currency]));
+  const debts = (await data.list('debts')).map(debtView);
+  const curById = Object.fromEntries(debts.map((d) => [String(d.id), d.currency]));
   let interestPaidTotal = 0;
-  for (const ip of await q('SELECT * FROM interest_payments')) {
-    const c = curById[ip.debt_id] || 'INR';
+  for (const ip of await data.list('interest_payments')) {
+    const c = curById[String(ip.debt_id)] || 'INR';
     bal[c] = (bal[c] || 0) - ip.amount;
     if (c === 'INR') interestPaidTotal += ip.amount;
   }
@@ -324,7 +320,7 @@ app.get('/api/summary', wrap(async (req, res) => {
     if (d.status === 'paying') c.emi += d.emi;
   }
 
-  const recur = await q('SELECT * FROM recurring');
+  const recur = await data.list('recurring');
   const sched = {};
   let ym = thisMonth();
   for (let i = 0; i < 12; i++) {
@@ -338,7 +334,7 @@ app.get('/api/summary', wrap(async (req, res) => {
   const monthMap = {};
   for (const e of all) {
     if (e.kind === 'transfer') continue;
-    const m = e.date.slice(0, 7);
+    const m = (e.date || '').slice(0, 7);
     monthMap[m] = monthMap[m] || { month: m, income: 0, expense: 0 };
     monthMap[m][e.kind] += inrValue(e);
   }
@@ -348,29 +344,17 @@ app.get('/api/summary', wrap(async (req, res) => {
   res.json({ income, expense, balance: income - expense, balances: bal, interestPaidTotal, byCurrency, schedule: sched, statusCounts, debtCount: active.length, monthly });
 }));
 
-// ---- chat (Anthropic API when key present; local `claude` CLI otherwise) ---
-// Chat client: API key, or OAuth (Max subscription) via ANTHROPIC_AUTH_TOKEN,
-// else fall back to the local `claude` CLI.
+// ---- chat ------------------------------------------------------------------
 let anthropic = null, chatMode = 'cli';
-if (process.env.ANTHROPIC_API_KEY) {
-  anthropic = new Anthropic();
-  chatMode = 'api';
-} else if (process.env.ANTHROPIC_AUTH_TOKEN) {
-  // OAuth bearer token — needs the oauth beta header; token is short-lived (~1h)
-  // and is NOT auto-refreshed here. Re-paste, or run a refresher, when it expires.
-  anthropic = new Anthropic({
-    authToken: process.env.ANTHROPIC_AUTH_TOKEN,
-    defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' },
-  });
-  chatMode = 'oauth';
-}
+if (process.env.ANTHROPIC_API_KEY) { anthropic = new Anthropic(); chatMode = 'api'; }
+else if (process.env.ANTHROPIC_AUTH_TOKEN) { anthropic = new Anthropic({ authToken: process.env.ANTHROPIC_AUTH_TOKEN, defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' } }); chatMode = 'oauth'; }
 const CHAT_MODEL = process.env.CHAT_MODEL || 'claude-opus-4-8';
 
 async function buildContext() {
-  const entries = (await q('SELECT * FROM entries ORDER BY date DESC LIMIT 60')).map(entryView);
-  const debts = (await q('SELECT * FROM debts')).map(debtView);
+  const entries = (await data.list('entries')).sort(byDateDesc).slice(0, 60).map(entryView);
+  const debts = (await data.list('debts')).map(debtView);
   const bal = { INR: 0, AED: 0 };
-  for (const e of await q('SELECT * FROM entries')) {
+  for (const e of await data.list('entries')) {
     const to = e.recv_currency || e.currency;
     if (e.kind === 'income') bal[to] += recvAmount(e);
     else if (e.kind === 'expense') bal[to] -= recvAmount(e);
@@ -388,38 +372,21 @@ Answer ONLY using the JSON data provided plus general financial reasoning. Be co
 app.post('/api/chat', wrap(async (req, res) => {
   const message = (req.body.message || '').trim();
   if (!message) throw new Error('Empty message');
-  const context = await buildContext();
-  const userContent = `=== USER FINANCE DATA (JSON) ===\n${context}\n\n=== USER QUESTION ===\n${message}`;
-
+  const userContent = `=== USER FINANCE DATA (JSON) ===\n${await buildContext()}\n\n=== USER QUESTION ===\n${message}`;
   if (anthropic) {
-    const msg = await anthropic.messages.create({
-      model: CHAT_MODEL,
-      max_tokens: 1024,
-      system: CHAT_SYSTEM,
-      messages: [{ role: 'user', content: userContent }],
-    });
-    const reply = msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
-    return res.json({ reply });
+    const msg = await anthropic.messages.create({ model: CHAT_MODEL, max_tokens: 1024, system: CHAT_SYSTEM, messages: [{ role: 'user', content: userContent }] });
+    return res.json({ reply: msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('').trim() });
   }
-  // Fallback: local `claude` CLI (subscription via OAuth, auto-refreshed by the CLI).
-  //  - CLAUDE_BIN        : absolute path to the binary if not on PATH.
-  //  - CLAUDE_CONFIG_DIR : which logged-in account/subscription to use. Point this
-  //    at a config dir you've logged into the desired account, so chat runs on that
-  //    subscription independently of any other login on the host.
   const child = spawn(process.env.CLAUDE_BIN || 'claude', ['-p'], { cwd: __dirname, env: process.env });
   let out = '', err = '';
   child.stdout.on('data', (d) => (out += d));
   child.stderr.on('data', (d) => (err += d));
   child.on('error', (e) => res.headersSent || res.status(500).json({ error: 'claude CLI failed: ' + e.message }));
-  child.on('close', (code) => {
-    if (res.headersSent) return;
-    if (code !== 0) return res.status(500).json({ error: err || 'claude exited ' + code });
-    res.json({ reply: out.trim() });
-  });
+  child.on('close', (code) => { if (res.headersSent) return; code !== 0 ? res.status(500).json({ error: err || 'claude exited ' + code }) : res.json({ reply: out.trim() }); });
   child.stdin.write(`${CHAT_SYSTEM}\n\n${userContent}`);
   child.stdin.end();
 }));
 
 const PORT = process.env.PORT || 3000;
-await init();
-app.listen(PORT, () => console.log(`My Finance running → http://localhost:${PORT}  [db=${process.env.DATABASE_URL ? 'postgres' : 'sqlite'}, auth=${AUTH}, chat=${chatMode}]`));
+await initData();
+app.listen(PORT, () => console.log(`My Finance running → http://localhost:${PORT}  [db=${BACKEND}, auth=${AUTH}, chat=${chatMode}]`));
