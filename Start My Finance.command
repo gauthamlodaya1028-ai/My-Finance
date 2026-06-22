@@ -8,6 +8,6 @@ if ! command -v node >/dev/null 2>&1; then
   echo "Node.js not found. Install it, then run again."; read -r _; exit 1
 fi
 [ -d node_modules ] || npm install
-( sleep 2 && open http://localhost:3000 ) &
-echo "Starting My Finance at http://localhost:3000  (close this window or Ctrl-C to stop)"
+( sleep 2 && open http://localhost:3001 ) &
+echo "Starting My Finance at http://localhost:3001  (close this window or Ctrl-C to stop)"
 npm start
