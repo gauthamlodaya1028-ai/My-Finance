@@ -136,7 +136,8 @@ on older DBs). Keep that pattern.
 | DELETE | `/api/recurring/:id` | delete recurring |
 | GET | `/api/commitments/:month` | commitments for a month |
 | GET | `/api/summary` | dashboard aggregates + balances |
-| POST | `/api/chat` | `{message}` → Claude reply (see §8) |
+
+(No chat endpoint — chat was removed. PDF export is client-side via jsPDF in [public/app.js](public/app.js) `exportPdf()`.)
 
 ---
 
@@ -153,7 +154,22 @@ The owner's **Earning** CSV is a key-value layout (not rows) — **no importer b
 
 ---
 
-## 8. Chat assistant (`POST /api/chat`)
+## 8. Chat — REMOVED (replaced by PDF export)
+
+The Claude chat assistant was **removed** (it needed the local `claude` CLI, which can't run on
+Hostinger Cloud's managed Node.js, and the goal was a no-API-cost setup). In its place, the app
+has a floating **Export PDF** button → `exportPdf()` in [public/app.js](public/app.js), which
+builds a summary report (totals, debts, monthly commitments) **client-side with jsPDF +
+autotable** (loaded via CDN in `index.html`). Uses "Rs " not ₹ in the PDF (jsPDF's built-in
+fonts lack the ₹ glyph). No server endpoint, no API key, no cost.
+
+<details><summary>Historical: the old chat implementation</summary>
+
+It built a context blob and called Claude via the Anthropic API, an OAuth token, or the local
+`claude` CLI. All of that code, the `@anthropic-ai/sdk` dep, and the `/api/chat` route are gone.
+</details>
+
+### (old chat notes below are obsolete)
 
 Builds a context blob (balances + debts + recent entries) and asks Claude. Three auth
 paths, chosen by env (see [.env.example](.env.example)); the boot log prints which one
