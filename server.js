@@ -1,10 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
-import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { createClient } from '@supabase/supabase-js';
-import Anthropic from '@anthropic-ai/sdk';
 import { data, BACKEND, initData } from './data.js';
 import { APPWRITE, verifyJwt } from './appwrite.js';
 
@@ -352,49 +350,6 @@ app.get('/api/summary', wrap(async (req, res) => {
   res.json({ income, expense, balance: income - expense, balances: bal, interestPaidTotal, byCurrency, schedule: sched, statusCounts, debtCount: active.length, monthly });
 }));
 
-// ---- chat ------------------------------------------------------------------
-let anthropic = null, chatMode = 'cli';
-if (process.env.ANTHROPIC_API_KEY) { anthropic = new Anthropic(); chatMode = 'api'; }
-else if (process.env.ANTHROPIC_AUTH_TOKEN) { anthropic = new Anthropic({ authToken: process.env.ANTHROPIC_AUTH_TOKEN, defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' } }); chatMode = 'oauth'; }
-const CHAT_MODEL = process.env.CHAT_MODEL || 'claude-opus-4-8';
-
-async function buildContext() {
-  const entries = (await data.list('entries')).sort(byDateDesc).slice(0, 60).map(entryView);
-  const debts = (await data.list('debts')).map(debtView);
-  const bal = { INR: 0, AED: 0 };
-  for (const e of await data.list('entries')) {
-    const to = e.recv_currency || e.currency;
-    if (e.kind === 'income') bal[to] += recvAmount(e);
-    else if (e.kind === 'expense') bal[to] -= recvAmount(e);
-    else if (e.kind === 'transfer') { bal.AED -= e.amount; bal.INR += e.amount * e.rate; }
-  }
-  return JSON.stringify({
-    note: 'Salary/incentive are decided in INR but paid in AED at a receive rate, then transferred AED->INR at a different rate. INR pays the EMIs.',
-    balances: bal, debts, recentEntries: entries,
-  });
-}
-
-const CHAT_SYSTEM = `You are a personal finance assistant embedded in the user's own "My Finance" app.
-Answer ONLY using the JSON data provided plus general financial reasoning. Be concise and practical, and use ₹ for INR and AED for AED. Do not invent numbers not supported by the data.`;
-
-app.post('/api/chat', wrap(async (req, res) => {
-  const message = (req.body.message || '').trim();
-  if (!message) throw new Error('Empty message');
-  const userContent = `=== USER FINANCE DATA (JSON) ===\n${await buildContext()}\n\n=== USER QUESTION ===\n${message}`;
-  if (anthropic) {
-    const msg = await anthropic.messages.create({ model: CHAT_MODEL, max_tokens: 1024, system: CHAT_SYSTEM, messages: [{ role: 'user', content: userContent }] });
-    return res.json({ reply: msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('').trim() });
-  }
-  const child = spawn(process.env.CLAUDE_BIN || 'claude', ['-p'], { cwd: __dirname, env: process.env });
-  let out = '', err = '';
-  child.stdout.on('data', (d) => (out += d));
-  child.stderr.on('data', (d) => (err += d));
-  child.on('error', (e) => res.headersSent || res.status(500).json({ error: 'claude CLI failed: ' + e.message }));
-  child.on('close', (code) => { if (res.headersSent) return; code !== 0 ? res.status(500).json({ error: err || 'claude exited ' + code }) : res.json({ reply: out.trim() }); });
-  child.stdin.write(`${CHAT_SYSTEM}\n\n${userContent}`);
-  child.stdin.end();
-}));
-
 const PORT = process.env.PORT || 3000;
 await initData();
-app.listen(PORT, () => console.log(`My Finance running → http://localhost:${PORT}  [db=${BACKEND}, auth=${AUTH}, chat=${chatMode}]`));
+app.listen(PORT, () => console.log(`My Finance running → http://localhost:${PORT}  [db=${BACKEND}, auth=${AUTH}]`));

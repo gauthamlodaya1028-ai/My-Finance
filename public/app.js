@@ -422,50 +422,52 @@ views.calendar = async () => {
   $('#next').onclick = () => { calRef = new Date(y, m + 1, 1); render(); };
 };
 
-// ---------- Chat (Claude Max via local CLI) ----------
-const chatLog = [];
-function toggleChat(open) {
-  const panel = $('#chat-panel');
-  panel.classList.toggle('open', open ?? !panel.classList.contains('open'));
-}
-function renderChat() {
-  $('#chat-messages').innerHTML = chatLog.map((m) =>
-    `<div class="chat-msg ${m.role}">${m.role === 'assistant' ? m.text : esc(m.text)}</div>`).join('');
-  const box = $('#chat-messages'); box.scrollTop = box.scrollHeight;
-}
-async function sendChat() {
-  const input = $('#chat-input');
-  const msg = input.value.trim();
-  if (!msg) return;
-  chatLog.push({ role: 'user', text: msg });
-  chatLog.push({ role: 'assistant', text: '<span class="muted">Thinking… (Claude Max)</span>' });
-  input.value = ''; renderChat();
+// ---------- PDF export ----------
+// PDF-safe currency (jsPDF's built-in fonts don't render the ₹ glyph → use "Rs ")
+const pm = (n, c = 'INR') => (c === 'INR' ? 'Rs ' : 'AED ') + Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+
+async function exportPdf() {
+  const btn = $('#export-fab'); const old = btn.textContent;
+  btn.textContent = 'Generating…'; btn.disabled = true;
   try {
-    const r = await api('/api/chat', { method: 'POST', body: { message: msg } });
-    chatLog[chatLog.length - 1] = { role: 'assistant', text: esc(r.reply).replace(/\n/g, '<br>') };
-  } catch (e) {
-    chatLog[chatLog.length - 1] = { role: 'assistant', text: '<span style="color:var(--red)">Error: ' + esc(e.message) + '</span>' };
-  }
-  renderChat();
+    const [s, debts] = await Promise.all([api('/api/summary'), api('/api/debts')]);
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF();
+    const date = new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+    const head = (c) => ({ fillColor: [79, 156, 249] });
+    doc.setFontSize(18); doc.text('My Finance — Summary', 14, 18);
+    doc.setFontSize(10); doc.setTextColor(120); doc.text('Generated ' + date, 14, 25); doc.setTextColor(0);
+
+    const curB = Object.keys(s.byCurrency || {});
+    const curAll = [...new Set([...curB, ...Object.values(s.schedule || {}).flatMap((m) => Object.keys(m))])];
+
+    const totals = [
+      ['INR on hand', pm(s.balances?.INR || 0, 'INR')],
+      ['AED on hand', pm(s.balances?.AED || 0, 'AED')],
+      ['Income (Rs equiv)', pm(s.income || 0)],
+      ['Expense (Rs equiv)', pm(s.expense || 0)],
+      ...curB.map((c) => ['Debt outstanding (' + c + ')', pm(s.byCurrency[c].remaining, c)]),
+      ...curB.filter((c) => s.byCurrency[c].emi).map((c) => ['EMI / month (' + c + ')', pm(s.byCurrency[c].emi, c)]),
+      ...curB.filter((c) => s.byCurrency[c].interest).map((c) => ['Interest / month (' + c + ')', pm(s.byCurrency[c].interest, c)]),
+    ];
+    doc.autoTable({ startY: 30, head: [['Summary', 'Amount']], body: totals, theme: 'grid', headStyles: head() });
+
+    const dbody = debts.map((d) => [d.source, d.currency, pm(d.remaining, d.currency), d.emi ? pm(d.emi, d.currency) : '-', d.remaining_months || '-', STATUS_LABEL[d.status] || d.status]);
+    doc.autoTable({ startY: doc.lastAutoTable.finalY + 8, head: [['Source', 'Cur', 'Remaining', 'EMI', 'Months', 'Status']], body: dbody, theme: 'striped', headStyles: head(), styles: { fontSize: 8 } });
+
+    const months = Object.keys(s.schedule || {}).sort().slice(0, 6);
+    if (months.length) {
+      const cbody = months.map((m) => [fmtMonth(m), ...curAll.map((c) => s.schedule[m][c] ? pm(s.schedule[m][c], c) : '-')]);
+      doc.autoTable({ startY: doc.lastAutoTable.finalY + 8, head: [['Month — commitments', ...curAll]], body: cbody, theme: 'grid', headStyles: head(), styles: { fontSize: 8 } });
+    }
+    doc.save('My-Finance-' + date.replace(/ /g, '-') + '.pdf');
+  } catch (e) { alert('Export failed: ' + e.message); }
+  finally { btn.textContent = old; btn.disabled = false; }
 }
-function mountChat() {
-  document.body.insertAdjacentHTML('beforeend', `
-    <button id="chat-fab" title="Ask Claude about your finances">💬 Ask Claude</button>
-    <div id="chat-panel">
-      <div class="chat-head"><b>Finance Assistant</b><span class="muted" style="font-size:.75rem;"> · Claude Max</span>
-        <button class="btn ghost small" id="chat-close" style="margin-left:auto;">✕</button></div>
-      <div id="chat-messages"><div class="chat-msg assistant">Hi! Ask me anything about your income, expenses, or debts — e.g. "How much EMI do I owe next month?" or "Which debt should I clear first?"</div></div>
-      <div class="chat-input-row">
-        <textarea id="chat-input" rows="1" placeholder="Ask about your finances…"></textarea>
-        <button class="btn" id="chat-send">Send</button>
-      </div>
-    </div>`);
-  $('#chat-fab').onclick = () => toggleChat();
-  $('#chat-close').onclick = () => toggleChat(false);
-  $('#chat-send').onclick = sendChat;
-  $('#chat-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
-  });
+
+function mountExport() {
+  document.body.insertAdjacentHTML('beforeend', `<button id="export-fab" title="Export a PDF summary">⬇ Export PDF</button>`);
+  $('#export-fab').onclick = exportPdf;
 }
 
 // ---------- auth bootstrap ----------
@@ -552,7 +554,7 @@ async function boot() {
     const { data: { session } } = await sb.auth.getSession();
     if (!session) { showSupabaseLogin(sb); return; }
   }
-  mountChat();
+  mountExport();
   render();
 }
 boot();

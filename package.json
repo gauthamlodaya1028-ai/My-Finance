@@ -9,7 +9,6 @@
     "dev": "node --watch server.js"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.69.0",
     "@supabase/supabase-js": "^2.47.10",
     "better-sqlite3": "^11.8.1",
     "dotenv": "^16.4.7",
