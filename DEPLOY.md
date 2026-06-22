@@ -65,16 +65,19 @@ which claude                 # → CLAUDE_BIN  (e.g. /root/.nvm/.../bin/claude)
 echo "$CLAUDE_CONFIG_DIR"    # if set; else the default is ~/.claude  (or ~/.config/claude)
 echo "test" | claude -p      # confirm it answers (which account/subscription)
 
-# 3. Create .env  (production values)
+# 3. Create .env  (production values — Appwrite backend)
 cat > .env <<'EOF'
-DATABASE_URL=postgresql://postgres.<ref>:<pwd>@aws-0-<region>.pooler.supabase.com:6543/postgres
-SUPABASE_URL=https://<ref>.supabase.co
-SUPABASE_ANON_KEY=<anon key>
+APPWRITE_ENDPOINT=https://sgp.cloud.appwrite.io/v1
+APPWRITE_PROJECT=6a39264f0000485dfbc1
+APPWRITE_API_KEY=<server api key>
+APPWRITE_DB=finance
 ALLOWED_EMAIL=you@example.com
 CLAUDE_BIN=/abs/path/to/claude          # from `which claude`
 CLAUDE_CONFIG_DIR=/root/.claude         # dir logged into the subscription account
 PORT=3000
 EOF
+# Appwrite DB + tables already exist (you ran appwrite-setup.js + migrate-to-appwrite.js
+# locally). The server just connects — no DB to provision on the host.
 
 # 4. Run it persistently with pm2 (survives reboots/crashes)
 npm install -g pm2
