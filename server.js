@@ -71,7 +71,7 @@ function scheduleFor(debt) {
 }
 const debtView = (d) => ({ ...d, schedule: scheduleFor(d) });
 
-function commitmentsForMonth(ym, debts, recurrings) {
+function commitmentsForMonth(ym, debts, recurrings, interestPayments = []) {
   const items = [];
   const now = thisMonth();
   const ord = (n) => n + (['th', 'st', 'nd', 'rd'][(n % 100 - 20) % 10] || ['th', 'st', 'nd', 'rd'][n] || 'th');
@@ -80,12 +80,18 @@ function commitmentsForMonth(ym, debts, recurrings) {
     const se = (d.schedule || scheduleFor(d)).find((s) => s.month === ym);
     if (se) items.push({ label: d.source, amount: se.amount, currency: d.currency, type: 'emi' });
     if (d.monthly_interest > 0 && ym >= now) {
-      const days = (d.interest_days || '').split(',').map((x) => parseInt(x.trim())).filter((x) => x >= 1 && x <= 31);
-      if (days.length > 1) {
-        const per = d.monthly_interest / days.length;
-        for (const dy of days) items.push({ label: `${d.source} (interest ${ord(dy)})`, amount: per, currency: d.currency, type: 'interest', estimate: true });
+      // If actual interest was logged this month, show the actuals (not the estimate).
+      const paid = interestPayments.filter((p) => String(p.debt_id) === String(d.id) && (p.date || '').slice(0, 7) === ym);
+      if (paid.length) {
+        for (const p of paid) items.push({ label: `${d.source} (interest paid${p.note ? ' ' + p.note : ''})`, amount: p.amount, currency: d.currency, type: 'interest' });
       } else {
-        items.push({ label: d.source + ' (interest est.)', amount: d.monthly_interest, currency: d.currency, type: 'interest', estimate: true });
+        const days = (d.interest_days || '').split(',').map((x) => parseInt(x.trim())).filter((x) => x >= 1 && x <= 31);
+        if (days.length > 1) {
+          const per = d.monthly_interest / days.length;
+          for (const dy of days) items.push({ label: `${d.source} (interest ${ord(dy)})`, amount: per, currency: d.currency, type: 'interest', estimate: true });
+        } else {
+          items.push({ label: d.source + ' (interest est.)', amount: d.monthly_interest, currency: d.currency, type: 'interest', estimate: true });
+        }
       }
     }
   }
@@ -288,7 +294,8 @@ app.delete('/api/recurring/:id', wrap(async (req, res) => { await data.remove('r
 app.get('/api/commitments/:month', wrap(async (req, res) => {
   const debts = (await data.list('debts')).map(debtView);
   const recur = await data.list('recurring');
-  res.json(commitmentsForMonth(req.params.month, debts, recur));
+  const interestPayments = await data.list('interest_payments');
+  res.json(commitmentsForMonth(req.params.month, debts, recur, interestPayments));
 }));
 
 // ---- summary ---------------------------------------------------------------
@@ -304,8 +311,9 @@ app.get('/api/summary', wrap(async (req, res) => {
   }
   const debts = (await data.list('debts')).map(debtView);
   const curById = Object.fromEntries(debts.map((d) => [String(d.id), d.currency]));
+  const interestPayments = await data.list('interest_payments');
   let interestPaidTotal = 0;
-  for (const ip of await data.list('interest_payments')) {
+  for (const ip of interestPayments) {
     const c = curById[String(ip.debt_id)] || 'INR';
     bal[c] = (bal[c] || 0) - ip.amount;
     if (c === 'INR') interestPaidTotal += ip.amount;
@@ -324,7 +332,7 @@ app.get('/api/summary', wrap(async (req, res) => {
   const sched = {};
   let ym = thisMonth();
   for (let i = 0; i < 12; i++) {
-    const items = commitmentsForMonth(ym, debts, recur);
+    const items = commitmentsForMonth(ym, debts, recur, interestPayments);
     if (items.length) { const m = (sched[ym] = sched[ym] || {}); for (const it of items) m[it.currency] = (m[it.currency] || 0) + it.amount; }
     ym = addMonths(ym, 1);
   }
