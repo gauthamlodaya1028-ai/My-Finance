@@ -8,9 +8,13 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
 export const PG = !!process.env.DATABASE_URL;
+// When Appwrite is the backend, don't open SQLite at all (avoids file locks).
+const APPWRITE = !!(process.env.APPWRITE_ENDPOINT && process.env.APPWRITE_PROJECT && process.env.APPWRITE_API_KEY);
 let pool, sdb;
 
-if (PG) {
+if (APPWRITE) {
+  // no-op: data.js routes everything to Appwrite
+} else if (PG) {
   pool = new pg.Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }, // Supabase requires SSL
